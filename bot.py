@@ -64,7 +64,18 @@ class PainelView(discord.ui.View):
         # colidir quando o mesmo técnico abre mais de um ticket (ex:
         # ticket-guilherme180826_1321).
         sufixo = datetime.now().strftime("%d%m%y_%H%M")
-        nome = f"ticket-{_slug(interaction.user.display_name)}{sufixo}"[:90]
+        # garante que o sufixo (identificador de data/hora) sempre seja preservado
+        # mesmo que o display_name seja muito longo: truncamos o slug para
+        # caber dentro do limite de 90 caracteres.
+        prefix = "ticket-"
+        max_len = 90
+        slug = _slug(interaction.user.display_name)
+        avail = max_len - len(prefix) - len(sufixo)
+        if avail < 1:
+            # fallback razoável caso o sufixo já ocupe quase tudo
+            nome = (prefix + sufixo)[:max_len]
+        else:
+            nome = (prefix + slug[:avail] + sufixo)[:max_len]
         try:
             thread = await canal.create_thread(
                 name=nome,
@@ -88,7 +99,21 @@ class PainelView(discord.ui.View):
             color=0x3498db,
         )
         embed.timestamp = discord.utils.utcnow()
-        await logmod.enviar(interaction.guild, "ticket", embed)
+        canal_log = await logmod.enviar(interaction.guild, "ticket", embed)
+        # também notifica via menção aos cargos administrativos (se definidos),
+        # assim a staff recebe alerta mesmo que por algum motivo não tenha sido
+        # adicionada à thread privada imediatamente.
+        if canal_log and config.ADMIN_ROLE_IDS:
+            mentions = []
+            for rid in config.ADMIN_ROLE_IDS:
+                role = interaction.guild.get_role(rid)
+                if role:
+                    mentions.append(role.mention)
+            if mentions:
+                try:
+                    await canal_log.send(" ".join(mentions))
+                except Exception:
+                    pass
 
         flow = TicketFlow(bot, thread, interaction.user)
         bot.loop.create_task(flow.run())
