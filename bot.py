@@ -29,16 +29,38 @@ async def _convidar_staff(thread: discord.Thread, guild: discord.Guild):
     """Adiciona à thread privada todo mundo com cargo administrativo, para que
     a staff veja o ticket assim que ele é aberto (e não só quando é fechado)."""
     role_ids = set(config.ADMIN_ROLE_IDS)
-    if not role_ids:
-        return
     for membro in guild.members:
         if membro.bot:
             continue
-        if role_ids & {r.id for r in membro.roles}:
+        permissoes = getattr(membro, "guild_permissions", None)
+        administrador = bool(permissoes and permissoes.administrator)
+        cargo_configurado = bool(role_ids & {r.id for r in membro.roles})
+        if administrador or cargo_configurado:
             try:
                 await thread.add_user(membro)
             except discord.HTTPException:
                 pass
+
+
+def _nome_ticket(nome_tecnico: str, nomes_em_uso=(), agora=None) -> str:
+    """Monta um nome legível e não repetido entre os tickets ativos."""
+    agora = agora or datetime.now()
+    sufixo = agora.strftime("%d%m%y_%H%M")
+    prefix = "ticket-"
+    max_len = 90
+    slug = _slug(nome_tecnico) or "tecnico"
+    base = prefix + slug[:max_len - len(prefix) - len(sufixo)] + sufixo
+    usados = set(nomes_em_uso)
+    if base not in usados:
+        return base
+
+    contador = 2
+    while True:
+        complemento = f"-{contador}"
+        candidato = base[:max_len - len(complemento)] + complemento
+        if candidato not in usados:
+            return candidato
+        contador += 1
 
 intents = discord.Intents.default()
 intents.message_content = True  # necessário para ler textos/anexos no fluxo
@@ -60,22 +82,10 @@ class PainelView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         canal = interaction.channel
 
-        # cria uma thread privada para o ticket. Nome com data/hora para não
-        # colidir quando o mesmo técnico abre mais de um ticket (ex:
-        # ticket-guilherme180826_1321).
-        sufixo = datetime.now().strftime("%d%m%y_%H%M")
-        # garante que o sufixo (identificador de data/hora) sempre seja preservado
-        # mesmo que o display_name seja muito longo: truncamos o slug para
-        # caber dentro do limite de 90 caracteres.
-        prefix = "ticket-"
-        max_len = 90
-        slug = _slug(interaction.user.display_name)
-        avail = max_len - len(prefix) - len(sufixo)
-        if avail < 1:
-            # fallback razoável caso o sufixo já ocupe quase tudo
-            nome = (prefix + sufixo)[:max_len]
-        else:
-            nome = (prefix + slug[:avail] + sufixo)[:max_len]
+        # Ex.: ticket-guilherme180826_1321. Se houver dois no mesmo minuto,
+        # o segundo recebe "-2", preservando nomes distintos.
+        nomes_ativos = (t.name for t in interaction.guild.threads)
+        nome = _nome_ticket(interaction.user.display_name, nomes_ativos)
         try:
             thread = await canal.create_thread(
                 name=nome,
@@ -83,11 +93,17 @@ class PainelView(discord.ui.View):
                 invitable=False,
             )
             await thread.add_user(interaction.user)
-            await _convidar_staff(thread, interaction.guild)
-        except (discord.HTTPException, AttributeError):
-            # fallback: thread pública a partir de uma mensagem
-            msg = await canal.send(f"Ticket de {interaction.user.mention}")
-            thread = await msg.create_thread(name=nome)
+        except (discord.HTTPException, AttributeError) as exc:
+            await interaction.followup.send(
+                "Não consegui criar uma thread privada. Confira se o bot tem "
+                "as permissões **Criar threads privadas**, **Gerenciar threads** "
+                "e **Enviar mensagens em threads**.",
+                ephemeral=True,
+            )
+            print(f"Falha ao criar ticket privado: {exc}")
+            return
+
+        await _convidar_staff(thread, interaction.guild)
 
         await interaction.followup.send(
             f"Seu ticket foi criado: {thread.mention}", ephemeral=True)
