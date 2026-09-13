@@ -146,6 +146,29 @@ def eh_admin(interaction: discord.Interaction) -> bool:
     return bool(ids & set(config.ADMIN_ROLE_IDS))
 
 
+def _checar_comando_de_acesso(interaction: discord.Interaction):
+    """Valida os comandos que gerenciam participantes de um ticket."""
+    canal = interaction.channel
+    if not isinstance(canal, discord.Thread) or not _eh_thread_ticket(canal):
+        return "Este comando só funciona dentro de um ticket."
+    if not eh_admin(interaction):
+        return "Sem permissão."
+    return None
+
+
+def _membros_do_alvo(membro: discord.Member = None,
+                      cargo: discord.Role = None):
+    """Expande membro/cargo em uma lista única de usuários não-bot."""
+    membros = []
+    vistos = set()
+    for item in ([membro] if membro else []) + (list(cargo.members) if cargo else []):
+        if item.bot or item.id in vistos:
+            continue
+        vistos.add(item.id)
+        membros.append(item)
+    return membros
+
+
 # --------------------------------------------------------------------------
 # Comandos
 # --------------------------------------------------------------------------
@@ -161,6 +184,74 @@ async def painel(interaction: discord.Interaction):
     )
     await interaction.channel.send(embed=embed, view=PainelView())
     await interaction.response.send_message("Painel publicado.", ephemeral=True)
+
+
+@bot.tree.command(description="Adiciona uma pessoa (ou um cargo) a este ticket.")
+@app_commands.describe(
+    membro="Quem você quer trazer para o ticket",
+    cargo="Ou um cargo inteiro, se não souber quem chamar")
+async def adicionar(interaction: discord.Interaction,
+                    membro: discord.Member = None,
+                    cargo: discord.Role = None):
+    if (erro := _checar_comando_de_acesso(interaction)):
+        await interaction.response.send_message(erro, ephemeral=True)
+        return
+    if not membro and not cargo:
+        await interaction.response.send_message(
+            "Informe um membro ou um cargo para adicionar.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    membros = _membros_do_alvo(membro, cargo)
+    adicionados, erros = [], 0
+    for alvo in membros:
+        try:
+            await interaction.channel.add_user(alvo)
+            adicionados.append(alvo.mention)
+        except discord.HTTPException:
+            erros += 1
+
+    if adicionados:
+        texto = (f"✅ {', '.join(adicionados)} foi adicionado ao ticket e "
+                 "já pode ver o histórico da conversa.")
+    else:
+        texto = "Não encontrei usuários válidos para adicionar."
+    if erros:
+        texto += f" Não consegui adicionar {erros} usuário(s)."
+    await interaction.followup.send(texto, ephemeral=True)
+
+
+@bot.tree.command(description="Remove uma pessoa (ou um cargo) deste ticket.")
+@app_commands.describe(membro="Quem você quer remover",
+                       cargo="Ou um cargo inteiro")
+async def remover(interaction: discord.Interaction,
+                  membro: discord.Member = None,
+                  cargo: discord.Role = None):
+    if (erro := _checar_comando_de_acesso(interaction)):
+        await interaction.response.send_message(erro, ephemeral=True)
+        return
+    if not membro and not cargo:
+        await interaction.response.send_message(
+            "Informe um membro ou um cargo para remover.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    membros = _membros_do_alvo(membro, cargo)
+    removidos, erros = [], 0
+    for alvo in membros:
+        try:
+            await interaction.channel.remove_user(alvo)
+            removidos.append(alvo.mention)
+        except discord.HTTPException:
+            erros += 1
+
+    if removidos:
+        texto = f"✅ {', '.join(removidos)} não tem mais acesso a este ticket."
+    else:
+        texto = "Não encontrei usuários válidos para remover."
+    if erros:
+        texto += f" Não consegui remover {erros} usuário(s)."
+    await interaction.followup.send(texto, ephemeral=True)
 
 
 @bot.tree.command(description="Lista chamados salvos (filtro opcional por categoria/mês).")
