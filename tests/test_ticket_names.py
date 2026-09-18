@@ -1,6 +1,13 @@
 from datetime import datetime
 
-from bot import _nome_ticket
+from bot import _nome_ticket, _thread_kwargs
+
+
+def test_thread_usa_arquivamento_maximo_para_nao_sumir_da_aba_ativa():
+    kwargs = _thread_kwargs()
+
+    assert kwargs["auto_archive_duration"] == 10080
+    assert kwargs["invitable"] is False
 
 
 def test_nome_ticket_inclui_tecnico_data_e_hora():

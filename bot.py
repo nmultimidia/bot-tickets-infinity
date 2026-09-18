@@ -25,6 +25,20 @@ def _slug(texto: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "", texto).lower()
 
 
+def _thread_kwargs():
+    """Mantém a thread ativa por 7 dias para não sumir da aba de tickets.
+
+    O Discord arquiva threads privadas automaticamente após o prazo configurado.
+    Para tickets em andamento, o padrão mais longo (7 dias) evita que o ticket
+    desapareça da lista ativa antes do fechamento manual.
+    """
+    return {
+        "type": discord.ChannelType.private_thread,
+        "invitable": False,
+        "auto_archive_duration": 10080,
+    }
+
+
 async def _convidar_staff(thread: discord.Thread, guild: discord.Guild):
     """Adiciona à thread privada todo mundo com cargo administrativo, para que
     a staff veja o ticket assim que ele é aberto (e não só quando é fechado)."""
@@ -89,8 +103,7 @@ class PainelView(discord.ui.View):
         try:
             thread = await canal.create_thread(
                 name=nome,
-                type=discord.ChannelType.private_thread,
-                invitable=False,
+                **_thread_kwargs(),
             )
             await thread.add_user(interaction.user)
         except (discord.HTTPException, AttributeError) as exc:
