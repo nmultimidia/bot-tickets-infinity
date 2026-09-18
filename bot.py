@@ -39,9 +39,13 @@ def _thread_kwargs():
     }
 
 
-async def _convidar_staff(thread: discord.Thread, guild: discord.Guild):
-    """Adiciona à thread privada todo mundo com cargo administrativo, para que
-    a staff veja o ticket assim que ele é aberto (e não só quando é fechado)."""
+def _eh_ticket_canal(canal) -> bool:
+    return isinstance(canal, discord.TextChannel) and canal.name.startswith("ticket-")
+
+
+async def _convidar_staff(canal, guild: discord.Guild):
+    """Concede acesso visual à staff e ao criador do ticket, sem depender de
+    threads privadas e do arquivamento automático do Discord."""
     role_ids = set(config.ADMIN_ROLE_IDS)
     for membro in guild.members:
         if membro.bot:
@@ -51,9 +55,16 @@ async def _convidar_staff(thread: discord.Thread, guild: discord.Guild):
         cargo_configurado = bool(role_ids & {r.id for r in membro.roles})
         if administrador or cargo_configurado:
             try:
-                await thread.add_user(membro)
+                await canal.set_permissions(membro, view_channel=True, send_messages=True,
+                                           read_message_history=True, manage_channels=True)
             except discord.HTTPException:
                 pass
+
+    try:
+        await canal.set_permissions(guild.default_role, view_channel=False, send_messages=False,
+                                   read_message_history=False)
+    except discord.HTTPException:
+        pass
 
 
 def _nome_ticket(nome_tecnico: str, nomes_em_uso=(), agora=None) -> str:
@@ -101,30 +112,43 @@ class PainelView(discord.ui.View):
         nomes_ativos = (t.name for t in interaction.guild.threads)
         nome = _nome_ticket(interaction.user.display_name, nomes_ativos)
         try:
-            thread = await canal.create_thread(
+            overwrites = {
+                interaction.guild.default_role: discord.PermissionOverwrite(
+                    view_channel=False,
+                    send_messages=False,
+                    read_message_history=False,
+                ),
+                interaction.user: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_channels=False,
+                ),
+            }
+            ticket_canal = await interaction.guild.create_text_channel(
                 name=nome,
-                **_thread_kwargs(),
+                category=canal.category,
+                overwrites=overwrites,
+                reason="Ticket em andamento",
             )
-            await thread.add_user(interaction.user)
         except (discord.HTTPException, AttributeError) as exc:
             await interaction.followup.send(
-                "Não consegui criar uma thread privada. Confira se o bot tem "
-                "as permissões **Criar threads privadas**, **Gerenciar threads** "
-                "e **Enviar mensagens em threads**.",
+                "Não consegui criar o canal do ticket. Confira se o bot tem "
+                "as permissões **Gerenciar canais** e **Gerenciar mensagens**.",
                 ephemeral=True,
             )
-            print(f"Falha ao criar ticket privado: {exc}")
+            print(f"Falha ao criar ticket em canal: {exc}")
             return
 
-        await _convidar_staff(thread, interaction.guild)
+        await _convidar_staff(ticket_canal, interaction.guild)
 
         await interaction.followup.send(
-            f"Seu ticket foi criado: {thread.mention}", ephemeral=True)
+            f"Seu ticket foi criado: {ticket_canal.mention}", ephemeral=True)
 
         embed = discord.Embed(
             title="🎫 Novo ticket criado",
             description=(f"Colaborador: {interaction.user.mention}\n"
-                         f"Thread: {thread.mention}"),
+                         f"Canal: {ticket_canal.mention}"),
             color=0x3498db,
         )
         embed.timestamp = discord.utils.utcnow()
@@ -144,7 +168,7 @@ class PainelView(discord.ui.View):
                 except Exception:
                     pass
 
-        flow = TicketFlow(bot, thread, interaction.user)
+        flow = TicketFlow(bot, ticket_canal, interaction.user)
         bot.loop.create_task(flow.run())
 
 
@@ -162,7 +186,7 @@ def eh_admin(interaction: discord.Interaction) -> bool:
 def _checar_comando_de_acesso(interaction: discord.Interaction):
     """Valida os comandos que gerenciam participantes de um ticket."""
     canal = interaction.channel
-    if not isinstance(canal, discord.Thread) or not _eh_thread_ticket(canal):
+    if not (isinstance(canal, discord.Thread) and _eh_thread_ticket(canal)) and not _eh_ticket_canal(canal):
         return "Este comando só funciona dentro de um ticket."
     if not eh_admin(interaction):
         return "Sem permissão."
@@ -219,7 +243,11 @@ async def adicionar(interaction: discord.Interaction,
     adicionados, erros = [], 0
     for alvo in membros:
         try:
-            await interaction.channel.add_user(alvo)
+            if isinstance(interaction.channel, discord.Thread):
+                await interaction.channel.add_user(alvo)
+            else:
+                await interaction.channel.set_permissions(alvo, view_channel=True, send_messages=True,
+                                                        read_message_history=True)
             adicionados.append(alvo.mention)
         except discord.HTTPException:
             erros += 1
@@ -253,7 +281,11 @@ async def remover(interaction: discord.Interaction,
     removidos, erros = [], 0
     for alvo in membros:
         try:
-            await interaction.channel.remove_user(alvo)
+            if isinstance(interaction.channel, discord.Thread):
+                await interaction.channel.remove_user(alvo)
+            else:
+                await interaction.channel.set_permissions(alvo, view_channel=False, send_messages=False,
+                                                        read_message_history=False)
             removidos.append(alvo.mention)
         except discord.HTTPException:
             erros += 1
@@ -284,14 +316,21 @@ async def listar(interaction: discord.Interaction, categoria: str = None, mes: s
         f"**{len(arquivos)} chamado(s):**\n" + "\n".join(linhas) + extra, ephemeral=True)
 
 
-@bot.tree.command(description="Fecha (arquiva) o ticket atual.")
+@bot.tree.command(description="Fecha o ticket atual.")
 async def fechar(interaction: discord.Interaction):
-    if not isinstance(interaction.channel, discord.Thread):
+    canal = interaction.channel
+    if not ((isinstance(canal, discord.Thread) and _eh_thread_ticket(canal)) or _eh_ticket_canal(canal)):
         await interaction.response.send_message(
             "Use este comando dentro de um ticket.", ephemeral=True)
         return
     await interaction.response.send_message("Fechando o ticket...", ephemeral=True)
-    await interaction.channel.edit(archived=True, locked=True)
+    if isinstance(canal, discord.Thread):
+        await canal.edit(archived=True, locked=True)
+    else:
+        await canal.edit(name=f"{canal.name}-fechado")
+        await canal.set_permissions(interaction.guild.default_role,
+                                   view_channel=False, send_messages=False,
+                                   read_message_history=False)
 
 
 def _eh_thread_ticket(thread: discord.Thread) -> bool:
