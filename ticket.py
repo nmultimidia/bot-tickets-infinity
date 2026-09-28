@@ -3,6 +3,7 @@ Motor do ticket. Conduz o colaborador pelo fluxo de perguntas do fluxograma,
 coleta textos e fotos, gera o PDF e salva na estrutura de pastas.
 """
 import asyncio
+from pathlib import Path
 from datetime import datetime
 
 import discord
@@ -16,6 +17,13 @@ from pdf_generator import gerar_pdf, extrair_localizacao
 
 # Palavras que o colaborador digita para encerrar o envio de várias fotos
 PALAVRAS_FIM = {"pronto", "fim", "ok", "concluir", "finalizar"}
+
+
+def _anexo_imagem(anexo):
+    tipo = (anexo.content_type or "").lower()
+    return tipo.startswith("image/") or Path(anexo.filename).suffix.lower() in {
+        ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff",
+    }
 
 
 class SelectView(discord.ui.View):
@@ -109,6 +117,7 @@ class TicketFlow:
         self.transcricao = []   # [(autor, texto)]
         self.respostas = []     # [{label, type, valor/imagens}]
         self.localizacao = None
+        self._mensagens = asyncio.Queue()
 
     # -- utilidades de conversa ------------------------------------------
 
@@ -120,8 +129,11 @@ class TicketFlow:
         return m.author.id == self.autor.id and m.channel.id == self.thread.id
 
     async def _aguardar_msg(self):
-        msg = await self.bot.wait_for("message", check=self._check_msg, timeout=STEP_TIMEOUT)
-        return msg
+        return await asyncio.wait_for(self._mensagens.get(), timeout=STEP_TIMEOUT)
+
+    async def _receber_msg(self, msg):
+        if self._check_msg(msg):
+            self._mensagens.put_nowait(msg)
 
     async def _ask_select(self, pergunta, opcoes):
         view = SelectView(opcoes, self.autor.id, placeholder=pergunta[:100])
@@ -171,9 +183,14 @@ class TicketFlow:
                 break
 
             if msg.attachments:
+                recebidas = 0
                 for att in msg.attachments:
-                    if att.content_type and att.content_type.startswith("image"):
+                    if _anexo_imagem(att):
                         imagens.append(await att.read())
+                        recebidas += 1
+                if not recebidas:
+                    await self._bot_diz("Nenhuma foto reconhecida. Envie uma imagem como JPG ou PNG.")
+                    continue
                 self.transcricao.append(
                     (self.autor.display_name, f"[{len(msg.attachments)} anexo(s)]"))
                 if not multiplas:
@@ -198,10 +215,14 @@ class TicketFlow:
     # -- execução do fluxo ------------------------------------------------
 
     async def run(self):
-        if config.FLUXO_TICKET_LIVRE:
-            await self._run_livre()
-        else:
-            await self._run_com_perguntas()
+        self.bot.add_listener(self._receber_msg, "on_message")
+        try:
+            if config.FLUXO_TICKET_LIVRE:
+                await self._run_livre()
+            else:
+                await self._run_com_perguntas()
+        finally:
+            self.bot.remove_listener(self._receber_msg, "on_message")
 
     async def _run_livre(self):
         """Ticket sem perguntas: o técnico envia texto/fotos à vontade e
@@ -224,7 +245,7 @@ class TicketFlow:
 
                 if msg.attachments:
                     for att in msg.attachments:
-                        if att.content_type and att.content_type.startswith("image"):
+                        if _anexo_imagem(att):
                             fotos.append(await att.read())
                     self.transcricao.append(
                         (self.autor.display_name,
