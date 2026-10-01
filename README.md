@@ -8,13 +8,15 @@ pastas padronizada.
 ## O que já está implementado
 
 - ✅ Botão **"Abrir Ticket"** (persistente — sobrevive a reinícios)
-- ✅ Fluxo completo do fluxograma: UFMT, VMMT, IFT e Coordenação de Segurança, com todos os subtipos e perguntas
+- ✅ Fluxo completo do fluxograma: UFMT, VMMT, GCT e COORDENAÇÃO DE SEGURANÇA, com todos os subtipos e perguntas
 - ✅ Coleta de textos, números e **fotos** (uma ou várias por etapa)
 - ✅ Pergunta **"Serviço concluído? (Sim/Não)"** onde o fluxo prevê
 - ✅ Registro automático: colaborador (login), data/hora e **localização via EXIF da foto**
 - ✅ Geração de **PDF** com metadados + respostas + fotos + transcrição da conversa
 - ✅ Salvamento na hierarquia: `Categoria / Mês Ano / Tipo de Serviço / Dia / arquivo.pdf`
 - ✅ Nome do PDF: `Dia_HoraMin_TipoServico_NomeColaborador.pdf`
+  (no ticket livre, que só pergunta a categoria, o tipo de serviço fica de fora:
+  `Categoria / Mês Ano / Dia / Dia_HoraMin_NomeColaborador.pdf`)
 - ✅ Upload do PDF **e dos arquivos originais** (fotos em resolução cheia, vídeos,
   documentos) também para o **Google Drive** (opcional)
 - ✅ Ticket livre à prova de perdas: o relatório é montado a partir do **histórico
@@ -56,22 +58,24 @@ python bot.py
 - O técnico clica em **Abrir Ticket** → o bot cria uma thread privada e faz as perguntas.
 - Dentro do ticket, a equipe usa `/adicionar @membro` (ou escolhe um cargo)
   para convidar alguém e `/remover` para retirar seu acesso.
+- Cargos em `TICKET_ROLE_IDS` (ex.: Equipe 1) entram automaticamente em todo ticket novo.
 - Ao final, o PDF é enviado no canal **e** salvo na pasta `STORAGE_ROOT`.
 
 ### Ticket livre (`FLUXO_TICKET_LIVRE=true`, padrão)
 
-1. O técnico escolhe o tipo de assunto/serviço e envia fotos e textos à vontade,
-   sem limite de tempo. Qualquer participante do ticket pode enviar fotos.
-2. Ao escrever **pronto** (também vale `Pronto.`, `tá pronto`, `finalizado`, ou
-   `pronto` junto da última foto), o canal trava para o técnico e aparece o botão
-   **Fechar e gerar relatório** para a administração.
+1. O técnico escolhe só o tipo de assunto (UFMT, VMMT, GCT ou COORDENAÇÃO DE
+   SEGURANÇA) e envia fotos e textos à vontade, sem limite de tempo. Qualquer
+   participante do ticket pode enviar fotos.
+2. Ao escrever **FINALIZAR TICKET** (maiúsculas/minúsculas e pontuação não
+   importam), o canal trava para o técnico e aparece o botão
+   **Fechar e gerar relatório** para a administração. "pronto" sozinho não trava mais.
 3. Ao clicar, o bot lê **todo o histórico do canal**, baixa cada anexo, gera o PDF
    e envia PDF + originais ao Drive. Se algo falhar (ex.: Drive), o erro aparece
    no canal e no log, o ticket **continua aberto** e o botão pode ser clicado de novo.
 
-**Recuperar um ticket** (bot reiniciou, "pronto" não respondeu, PDF saiu sem fotos):
-dentro do canal do ticket, rode `/gerar_relatorio`. Em tickets antigos, que não têm
-a categoria registrada, informe `categoria` e `tipo`. Funciona também em canais já
+**Recuperar um ticket** (bot reiniciou, "FINALIZAR TICKET" não respondeu, PDF saiu
+sem fotos): dentro do canal do ticket, rode `/gerar_relatorio`. Em tickets antigos,
+que não têm a categoria registrada, informe `categoria` (o `tipo` é opcional). Funciona também em canais já
 fechados (`-fechado`) — gera um relatório novo sem apagar o anterior.
 - `/limpar [dias]` apaga as threads de ticket já arquivadas (pede confirmação); use `dias` para só apagar as mais antigas.
 

@@ -80,6 +80,37 @@ class PedidoDeFimTests(unittest.TestCase):
         self.assertTrue(ticket.eh_pedido_de_fim('ok', ticket.PALAVRAS_FIM))
 
 
+class FinalizarTicketTests(unittest.TestCase):
+    def test_aceita_a_frase_em_qualquer_caixa(self):
+        for texto in ('FINALIZAR TICKET', 'finalizar ticket', ' Finalizar ticket! ',
+                      'finalizar  ticket.'):
+            self.assertTrue(ticket.eh_finalizar_ticket(texto), texto)
+
+    def test_pronto_e_outras_frases_nao_travam(self):
+        for texto in ('', 'pronto', 'finalizar', 'ticket', 'finalizado',
+                      'não finalizar ticket', 'finalizar ticket amanhã'):
+            self.assertFalse(ticket.eh_finalizar_ticket(texto), texto)
+
+
+class TratarMensagemTests(unittest.IsolatedAsyncioTestCase):
+    async def _tratar(self, texto):
+        canal = SimpleNamespace(name='ticket-x', id=1)
+        msg = SimpleNamespace(author=pessoa(2, 'Tec'), channel=canal, content=texto)
+        antigos = ticket.marcar_pronto, ticket._eh_canal_ticket, config.FLUXO_TICKET_LIVRE
+        ticket.marcar_pronto = AsyncMock()
+        ticket._eh_canal_ticket = lambda c: True
+        config.FLUXO_TICKET_LIVRE = True
+        try:
+            await ticket.tratar_mensagem(None, msg)
+            return ticket.marcar_pronto
+        finally:
+            ticket.marcar_pronto, ticket._eh_canal_ticket, config.FLUXO_TICKET_LIVRE = antigos
+
+    async def test_so_finalizar_ticket_trava(self):
+        (await self._tratar('FINALIZAR TICKET')).assert_awaited_once()
+        (await self._tratar('pronto')).assert_not_awaited()
+
+
 class TopicoTests(unittest.TestCase):
     def test_ida_e_volta(self):
         topico = ticket.montar_topico(autor=2, categoria='Abertura de OS - UFMT',
@@ -106,6 +137,19 @@ class StorageTests(unittest.TestCase):
                 storage.STORAGE_ROOT = antigo
             self.assertNotEqual(primeiro, segundo)
             self.assertTrue(segundo.endswith('_2.pdf'))
+
+    def test_sem_tipo_de_servico(self):
+        quando = datetime(2026, 9, 29, 21, 5)
+        self.assertEqual(storage.componentes_pasta('Abertura de OS - GCT', None, quando),
+                         ['Abertura de OS - GCT', 'Setembro 2026', '29'])
+        with tempfile.TemporaryDirectory() as raiz:
+            antigo = storage.STORAGE_ROOT
+            storage.STORAGE_ROOT = raiz
+            try:
+                caminho = storage.montar_caminho('Abertura de OS - GCT', None, 'João', quando)
+            finally:
+                storage.STORAGE_ROOT = antigo
+        self.assertEqual(Path(caminho).name, '29_2105_Joao.pdf')
 
     def test_nome_anexo_seguro(self):
         self.assertEqual(storage.nome_anexo(3, '../a:b?.jpg'), '003_a_b_.jpg')
@@ -159,9 +203,8 @@ class HistoricoTests(unittest.IsolatedAsyncioTestCase):
     async def test_finaliza_a_partir_do_historico(self):
         canal = CanalFalso(
             [mensagem(self.tecnico, 'material: 10m cabo <cat6>', [Anexo('a.jpg', foto())]),
-             mensagem(self.tecnico, 'pronto')],
-            topic=ticket.montar_topico(autor=2, categoria='Abertura de OS - UFMT',
-                                       tipo='OS Instalação'),
+             mensagem(self.tecnico, 'FINALIZAR TICKET')],
+            topic=ticket.montar_topico(autor=2, categoria='Abertura de OS - GCT'),
             membros=[self.tecnico])
         bot = SimpleNamespace(user=self.bot_user)
         envio_log = AsyncMock()
@@ -180,6 +223,8 @@ class HistoricoTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(pdfs), 1)
             self.assertIn(b'/Subtype /Image', pdfs[0].read_bytes())
             self.assertEqual([p.name for p in originais], ['001_a.jpg'])
+            self.assertEqual(pdfs[0].relative_to(raiz).parts[:2],
+                             ('Abertura de OS - GCT', 'Setembro 2026'))
             for c in canal.send.await_args_list:   # o send real fecha o arquivo
                 if 'file' in c.kwargs:
                     c.kwargs['file'].close()

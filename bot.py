@@ -133,6 +133,15 @@ class PainelView(discord.ui.View):
                     read_message_history=True,
                 ),
             }
+            # Cargos que acompanham todos os tickets (ex: Equipe 1).
+            for rid in config.TICKET_ROLE_IDS:
+                cargo = interaction.guild.get_role(rid)
+                if cargo:
+                    overwrites[cargo] = discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                    )
             ticket_canal = await interaction.guild.create_text_channel(
                 name=nome,
                 category=canal.category,
@@ -346,7 +355,7 @@ async def fechar(interaction: discord.Interaction):
     description="Gera (ou gera de novo) o relatório deste ticket a partir do histórico.")
 @app_commands.describe(
     categoria="Só se o ticket não tiver categoria registrada",
-    tipo="Tipo de serviço (junto com a categoria)",
+    tipo="Tipo de serviço (opcional, junto com a categoria)",
     colaborador="Quem fez o atendimento (padrão: quem abriu o ticket)")
 @app_commands.choices(categoria=[
     app_commands.Choice(name=c, value=c) for c in fluxo.categorias()])
@@ -358,11 +367,11 @@ async def gerar_relatorio(interaction: discord.Interaction,
         await interaction.response.send_message(erro, ephemeral=True)
         return
     cat = categoria.value if categoria else None
-    if bool(cat) != bool(tipo):
+    if tipo and not cat:
         await interaction.response.send_message(
-            "Informe a categoria **e** o tipo juntos (ou nenhum dos dois).", ephemeral=True)
+            "Para informar o tipo, informe também a categoria.", ephemeral=True)
         return
-    if cat and tipo not in fluxo.subtipos(cat):
+    if tipo and tipo not in fluxo.subtipos(cat):
         await interaction.response.send_message(
             f"Tipo inválido para {cat}. Opções: {', '.join(fluxo.subtipos(cat))}.",
             ephemeral=True)

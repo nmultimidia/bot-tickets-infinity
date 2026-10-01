@@ -1,9 +1,9 @@
 """
 Motor do ticket.
 
-Fluxo livre (padrão): o técnico escolhe categoria/tipo e envia textos e fotos
-à vontade. Ao escrever "pronto", o canal trava para ele e a administração
-recebe o botão para gerar o relatório.
+Fluxo livre (padrão): o técnico escolhe só a categoria e envia textos e fotos
+à vontade. Ao escrever "FINALIZAR TICKET", o canal trava para ele e a
+administração recebe o botão para gerar o relatório.
 
 O relatório do fluxo livre é montado a partir do HISTÓRICO do canal, e não da
 memória do bot. Assim nada se perde se o bot reiniciar, se o técnico demorar
@@ -63,6 +63,15 @@ def eh_pedido_de_fim(texto, palavras=PALAVRAS_FIM_LIVRE, max_palavras=3):
     if not msg or len(msg) > max_palavras or _NEGACOES & set(msg):
         return False
     return any(p in palavras for p in msg)
+
+
+# No fluxo livre, só esta frase trava o ticket ("pronto" sozinho não vale mais).
+FRASE_FINALIZAR = "FINALIZAR TICKET"
+
+
+def eh_finalizar_ticket(texto):
+    """Aceita "FINALIZAR TICKET", "finalizar ticket", "Finalizar ticket!"..."""
+    return _palavras(texto) == _palavras(FRASE_FINALIZAR)
 
 
 # --------------------------------------------------------------------------
@@ -206,14 +215,11 @@ class YesNoView(discord.ui.View):
 
 
 async def escolher_categoria(canal, autor_id, timeout=None):
-    """Pergunta categoria e tipo pelos menus. Devolve (categoria, subtipo)."""
-    escolhas = []
-    for pergunta, opcoes in (("Qual o tipo de assunto?", lambda: flow.categorias()),
-                             ("Qual o tipo de serviço?", lambda: flow.subtipos(escolhas[0]))):
-        view = SelectView(opcoes(), autor_id, placeholder=pergunta, timeout=timeout)
-        await canal.send(pergunta, view=view)
-        escolhas.append(await view.future)
-    return escolhas[0], escolhas[1]
+    """Pergunta só a categoria pelo menu (o tipo de serviço não é mais pedido)."""
+    pergunta = "Qual o tipo de assunto?"
+    view = SelectView(flow.categorias(), autor_id, placeholder=pergunta, timeout=timeout)
+    await canal.send(pergunta, view=view)
+    return await view.future
 
 
 def _pode_fechar(member: discord.Member) -> bool:
@@ -272,14 +278,14 @@ def _eh_canal_ticket(canal) -> bool:
 
 
 async def tratar_mensagem(bot, msg: discord.Message):
-    """Listener global de on_message: detecta o "pronto" em qualquer ticket,
-    de qualquer participante, mesmo depois de o bot reiniciar."""
+    """Listener global de on_message: detecta o "FINALIZAR TICKET" em qualquer
+    ticket, de qualquer participante, mesmo depois de o bot reiniciar."""
     if msg.author.bot or not config.FLUXO_TICKET_LIVRE:
         return
     canal = msg.channel
     if not _eh_canal_ticket(canal) or canal.name.endswith("-fechado"):
         return
-    if not eh_pedido_de_fim(msg.content):
+    if not eh_finalizar_ticket(msg.content):
         return
     if canal.id in _marcando_pronto:
         return
@@ -287,13 +293,14 @@ async def tratar_mensagem(bot, msg: discord.Message):
     try:
         await marcar_pronto(canal, msg.author)
     except asyncio.TimeoutError:
-        await canal.send("⏱️ A categoria não foi escolhida. Escreva **pronto** de novo quando quiser.")
+        await canal.send(f"⏱️ A categoria não foi escolhida. Escreva **{FRASE_FINALIZAR}** "
+                         "de novo quando quiser.")
     except Exception as e:  # noqa
         traceback.print_exc()
         await canal.send(
             f"❌ Não consegui marcar o ticket como concluído: `{e}`\n"
             "Nada foi perdido: todas as mensagens e fotos continuam neste canal. "
-            "Escreva **pronto** de novo ou chame a administração.")
+            f"Escreva **{FRASE_FINALIZAR}** de novo ou chame a administração.")
     finally:
         _marcando_pronto.discard(canal.id)
 
@@ -301,10 +308,11 @@ async def tratar_mensagem(bot, msg: discord.Message):
 async def marcar_pronto(canal, quem):
     dados = ler_topico(canal)
     autor = await _autor_do_canal(canal, dados) or quem
+    # Tickets antigos podem ter tipo de serviço gravado; os novos só categoria.
     categoria, subtipo = dados.get("categoria"), dados.get("tipo")
-    if categoria not in flow.categorias() or subtipo not in flow.subtipos(categoria):
-        await canal.send(f"{quem.mention}, antes de finalizar escolha o tipo de assunto e de serviço:")
-        categoria, subtipo = await escolher_categoria(canal, quem.id, timeout=3600)
+    if not categoria:
+        await canal.send(f"{quem.mention}, antes de finalizar escolha o tipo de assunto:")
+        categoria, subtipo = await escolher_categoria(canal, quem.id, timeout=3600), None
         await _gravar_categoria(canal, autor.id, categoria, subtipo)
 
     await _permitir_envio(canal, autor, False)
@@ -315,7 +323,7 @@ async def marcar_pronto(canal, quem):
     embed = discord.Embed(
         title="🔒 Ticket pronto para fechamento",
         description=(f"Colaborador: {autor.mention}\n"
-                     f"Categoria: **{categoria}** • Tipo: **{subtipo}**\n"
+                     f"{_rotulo_categoria(categoria, subtipo)}\n"
                      f"Canal: {canal.mention}"),
         color=0xf1c40f,
     )
@@ -363,7 +371,8 @@ async def coletar_historico(canal, bot_user, autor_id, pasta_anexos) -> Historic
         nome = msg.author.display_name
         quando = msg.created_at.astimezone().strftime("%d/%m %H:%M")
         conteudo = (msg.content or "").strip()
-        if conteudo and not eh_pedido_de_fim(conteudo):
+        # A frase de fechamento (e o "pronto" de tickets antigos) não entra no relatório.
+        if conteudo and not (eh_finalizar_ticket(conteudo) or eh_pedido_de_fim(conteudo)):
             h.textos.append(conteudo if msg.author.id == autor_id else f"{nome}: {conteudo}")
 
         for att in msg.attachments:
@@ -399,12 +408,12 @@ async def finalizar_ticket_livre(bot, canal, *, categoria=None, subtipo=None, au
     async with trava:
         try:
             dados = ler_topico(canal)
-            categoria = categoria or dados.get("categoria")
-            subtipo = subtipo or dados.get("tipo")
-            if not categoria or not subtipo:
+            if not categoria:
+                categoria, subtipo = dados.get("categoria"), dados.get("tipo")
+            if not categoria:
                 await canal.send(
-                    "❌ Não sei a categoria/tipo deste ticket. A administração pode usar "
-                    "`/gerar_relatorio` informando a categoria e o tipo.")
+                    "❌ Não sei a categoria deste ticket. A administração pode usar "
+                    "`/gerar_relatorio` informando a categoria.")
                 return False
 
             await canal.send("📥 Lendo o histórico do ticket e baixando os arquivos... ⏳")
@@ -443,6 +452,11 @@ async def finalizar_ticket_livre(bot, canal, *, categoria=None, subtipo=None, au
                 "Nada foi perdido: todas as mensagens e fotos continuam neste canal. "
                 "Tente de novo pelo botão ou com `/gerar_relatorio`.")
             return False
+
+
+def _rotulo_categoria(categoria, subtipo=None):
+    texto = f"Categoria: **{categoria}**"
+    return texto + (f" • Tipo: **{subtipo}**" if subtipo else "")
 
 
 def _corta(texto, limite=300):
@@ -486,7 +500,7 @@ async def registrar_chamado(canal, *, autor, categoria, subtipo, quando, caminho
     linhas = [
         "✅ **Chamado registrado!**" if ok else "⚠️ **Chamado registrado com pendências**",
         f"Colaborador: **{nome_autor}**",
-        f"Categoria: **{categoria}** • Tipo: **{subtipo}**",
+        _rotulo_categoria(categoria, subtipo),
         f"Data/Hora: **{quando.strftime('%d/%m/%Y %H:%M')}**",
         f"Localização: **{localizacao or 'não disponível'}**",
         f"Fotos: **{n_fotos}**" + (f" • Outros arquivos: **{n_outros}**" if n_outros else ""),
@@ -516,7 +530,7 @@ async def registrar_chamado(canal, *, autor, categoria, subtipo, quando, caminho
     embed = discord.Embed(
         title="✅ Ticket finalizado" if ok else "⚠️ Ticket com pendências",
         description=(f"Colaborador: {autor.mention if autor else nome_autor}\n"
-                     f"Categoria: **{categoria}** • Tipo: **{subtipo}**\n"
+                     f"{_rotulo_categoria(categoria, subtipo)}\n"
                      f"Data/Hora: **{quando.strftime('%d/%m/%Y %H:%M')}**\n"
                      f"Canal: {canal.mention}\n"
                      f"Arquivo: `{nome}`"),
@@ -663,22 +677,22 @@ class TicketFlow:
             self.bot.remove_listener(self._receber_msg, "on_message")
 
     async def _run_livre(self):
-        """Ticket sem perguntas: só pede categoria/tipo e grava no tópico.
-        O "pronto" e o relatório são tratados por tratar_mensagem e
+        """Ticket sem perguntas: só pede a categoria e grava no tópico.
+        O "FINALIZAR TICKET" e o relatório são tratados por tratar_mensagem e
         finalizar_ticket_livre, a partir do histórico do canal."""
         try:
+            categoria = await escolher_categoria(self.thread, self.autor.id)
+            await _gravar_categoria(self.thread, self.autor.id, categoria, None)
             await self._bot_diz(
+                f"📂 **{categoria}** registrado.\n"
                 f"Olá, {self.autor.mention}! Pode enviar fotos, textos e informações "
-                f"à vontade, sem limite de tempo. Quando finalizar o atendimento, "
-                f"escreva **pronto**.")
-            categoria, subtipo = await escolher_categoria(self.thread, self.autor.id)
-            await _gravar_categoria(self.thread, self.autor.id, categoria, subtipo)
-            await self._bot_diz(f"📂 **{categoria}** • **{subtipo}** registrado.")
+                f"à vontade, sem limite de tempo. Quando terminar o atendimento, "
+                f"escreva **{FRASE_FINALIZAR}**.")
         except Exception as e:  # noqa
             traceback.print_exc()
             await self.thread.send(
                 f"❌ Erro ao registrar a categoria: `{e}`. Pode continuar enviando "
-                "fotos e textos; ao escrever **pronto** eu pergunto de novo.")
+                f"fotos e textos; ao escrever **{FRASE_FINALIZAR}** eu pergunto de novo.")
 
     async def _run_com_perguntas(self):
         try:

@@ -70,7 +70,7 @@ FLOW = {
         ],
     },
 
-    "Abertura de OS - IFT": {
+    "Abertura de OS - GCT": {
         "Bater Ponto": [
             {"type": "selfie", "label": "Selfie do colaborador"},
         ],
@@ -90,7 +90,7 @@ FLOW = {
         ],
     },
 
-    "Coordenação de Segurança": {
+    "COORDENAÇÃO DE SEGURANÇA": {
         "Ocorrência - Patrimonial": [
             {"type": "text",  "label": "Descreva a ocorrência"},
             {"type": "photo", "label": "Fotos da ocorrência (opcional)", "multiple": True, "optional": True},

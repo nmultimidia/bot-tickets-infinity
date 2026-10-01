@@ -8,6 +8,10 @@ Nome do PDF:
   [Dia]_[HoraMin]_[TipoServico]_[NomeColaborador].pdf
   ex: 10_1432_OSInstalacao_JoaoSilva.pdf
 
+No ticket livre só a categoria é perguntada; sem tipo de serviço, a pasta e
+o nome do arquivo simplesmente não têm esse trecho:
+  [Bloco/Categoria] / [Mês Ano] / [Dia] / 10_1432_JoaoSilva.pdf
+
 Os arquivos originais (fotos em resolução cheia, vídeos, documentos) ficam
 ao lado, na pasta  [nome do PDF sem .pdf]_arquivos/.
 """
@@ -20,15 +24,16 @@ from config import STORAGE_ROOT, MESES, camel
 SUFIXO_ANEXOS = "_arquivos"
 
 
-def componentes_pasta(categoria: str, subtipo: str, quando: datetime):
-    """Devolve a lista ordenada de subpastas: [categoria, mês, tipo, dia].
-    Usada tanto no disco local quanto para recriar a árvore no Google Drive."""
+def componentes_pasta(categoria: str, subtipo, quando: datetime):
+    """Devolve a lista ordenada de subpastas: [categoria, mês, tipo, dia]
+    (sem o tipo, se não houver). Usada tanto no disco local quanto para
+    recriar a árvore no Google Drive."""
     mes = f"{MESES[quando.month]} {quando.year}"
     dia = quando.strftime("%d")
-    return [categoria, mes, subtipo, dia]
+    return [c for c in (categoria, mes, subtipo, dia) if c]
 
 
-def montar_caminho(categoria: str, subtipo: str, colaborador: str, quando: datetime):
+def montar_caminho(categoria: str, subtipo, colaborador: str, quando: datetime):
     """Cria (se necessário) as pastas e devolve o caminho completo do PDF.
     Nunca sobrescreve um relatório existente: acrescenta _2, _3..."""
     comps = componentes_pasta(categoria, subtipo, quando)
@@ -36,7 +41,8 @@ def montar_caminho(categoria: str, subtipo: str, colaborador: str, quando: datet
     os.makedirs(pasta, exist_ok=True)
 
     dia = quando.strftime("%d")
-    base = f"{dia}_{quando.strftime('%H%M')}_{camel(subtipo)}_{camel(colaborador)}"
+    partes = [dia, quando.strftime("%H%M"), camel(subtipo or ""), camel(colaborador)]
+    base = "_".join(p for p in partes if p)
     caminho = os.path.join(pasta, base + ".pdf")
     contador = 2
     while os.path.exists(caminho) or os.path.exists(pasta_anexos(caminho)):

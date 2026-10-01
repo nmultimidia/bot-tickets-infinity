@@ -124,7 +124,8 @@ def gerar_pdf(caminho_saida, *, meta, respostas, transcricao):
     els = []
 
     els.append(Paragraph("Relatório de Chamado", titulo))
-    els.append(Paragraph(_texto(meta["categoria"] + " • " + meta["subtipo"]), subt))
+    rotulo = " • ".join(filter(None, (meta["categoria"], meta.get("subtipo"))))
+    els.append(Paragraph(_texto(rotulo), subt))
     els.append(Spacer(1, 0.5 * cm))
 
     # Tabela de metadados
@@ -133,7 +134,7 @@ def gerar_pdf(caminho_saida, *, meta, respostas, transcricao):
         ["Colaborador", meta["colaborador"]],
         ["Data/Hora", dh.strftime("%d/%m/%Y %H:%M")],
         ["Categoria", meta["categoria"]],
-        ["Tipo de serviço", meta["subtipo"]],
+        *([["Tipo de serviço", meta["subtipo"]]] if meta.get("subtipo") else []),
         ["Localização (via foto)", meta.get("localizacao") or "Não disponível"],
     ]
     if meta.get("gerado_em"):
