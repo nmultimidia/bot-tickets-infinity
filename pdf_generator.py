@@ -9,6 +9,7 @@ O PDF contém:
 """
 import io
 from datetime import datetime
+from xml.sax.saxutils import escape
 
 from PIL import Image as PILImage, ExifTags
 from reportlab.lib.pagesizes import A4
@@ -18,6 +19,19 @@ from reportlab.lib import colors
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle,
 )
+
+# Fotos HEIC/HEIF (iPhone enviando como arquivo), se a lib estiver instalada
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
+
+def _texto(valor) -> str:
+    """Escapa o texto do usuário: '<', '>' e '&' são marcação no reportlab e
+    derrubavam a geração do PDF inteiro."""
+    return escape(str(valor)).replace("\n", "<br/>")
 
 # ---------------------------------------------------------------------------
 # EXIF / GPS
@@ -110,7 +124,7 @@ def gerar_pdf(caminho_saida, *, meta, respostas, transcricao):
     els = []
 
     els.append(Paragraph("Relatório de Chamado", titulo))
-    els.append(Paragraph(meta["categoria"] + " • " + meta["subtipo"], subt))
+    els.append(Paragraph(_texto(meta["categoria"] + " • " + meta["subtipo"]), subt))
     els.append(Spacer(1, 0.5 * cm))
 
     # Tabela de metadados
@@ -122,6 +136,8 @@ def gerar_pdf(caminho_saida, *, meta, respostas, transcricao):
         ["Tipo de serviço", meta["subtipo"]],
         ["Localização (via foto)", meta.get("localizacao") or "Não disponível"],
     ]
+    if meta.get("gerado_em"):
+        linhas.append(["Relatório gerado em", meta["gerado_em"].strftime("%d/%m/%Y %H:%M")])
     tab = Table(linhas, colWidths=[5 * cm, 11 * cm])
     tab.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f0f0f0")),
@@ -138,7 +154,7 @@ def gerar_pdf(caminho_saida, *, meta, respostas, transcricao):
     # Respostas
     els.append(Paragraph("Informações preenchidas", styles["Heading2"]))
     for r in respostas:
-        els.append(Paragraph(r["label"], styles["Rotulo"]))
+        els.append(Paragraph(_texto(r["label"]), styles["Rotulo"]))
         if r["type"] in ("photo", "selfie"):
             imgs = r.get("imagens", [])
             if not imgs:
@@ -151,14 +167,13 @@ def gerar_pdf(caminho_saida, *, meta, respostas, transcricao):
                     els.append(Paragraph("[falha ao renderizar imagem]", styles["Valor"]))
         else:
             valor = r.get("valor", "") or "—"
-            els.append(Paragraph(str(valor).replace("\n", "<br/>"), styles["Valor"]))
+            els.append(Paragraph(_texto(valor), styles["Valor"]))
 
     # Transcrição
     els.append(Spacer(1, 0.4 * cm))
     els.append(Paragraph("Histórico da conversa", styles["Heading2"]))
     for autor, texto in transcricao:
-        els.append(Paragraph(f"<b>{autor}:</b> {str(texto).replace(chr(10), '<br/>')}",
-                             styles["Valor"]))
+        els.append(Paragraph(f"<b>{_texto(autor)}:</b> {_texto(texto)}", styles["Valor"]))
 
     doc.build(els)
     return caminho_saida

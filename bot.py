@@ -3,7 +3,7 @@ Ponto de entrada do bot.
 
 - Posta um painel com o botão "Abrir Ticket" (comando /painel ou canal fixo).
 - Ao clicar, cria uma thread privada e inicia o fluxo de perguntas.
-- Comandos administrativos: /painel, /listar, /fechar, /limpar.
+- Comandos administrativos: /painel, /listar, /fechar, /limpar, /gerar_relatorio.
 """
 import re
 import unicodedata
@@ -14,7 +14,9 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
+import flow as fluxo
 import logs as logmod
+import ticket
 from ticket import TicketFlow
 import storage
 
@@ -109,7 +111,7 @@ class PainelView(discord.ui.View):
 
         # Ex.: ticket-guilherme180826_1321. Se houver dois no mesmo minuto,
         # o segundo recebe "-2", preservando nomes distintos.
-        nomes_ativos = (t.name for t in interaction.guild.threads)
+        nomes_ativos = (c.name for c in interaction.guild.text_channels)
         nome = _nome_ticket(interaction.user.display_name, nomes_ativos)
         try:
             overwrites = {
@@ -124,11 +126,18 @@ class PainelView(discord.ui.View):
                     read_message_history=True,
                     manage_channels=False,
                 ),
+                # O próprio bot precisa ler o histórico para montar o relatório.
+                interaction.guild.me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                ),
             }
             ticket_canal = await interaction.guild.create_text_channel(
                 name=nome,
                 category=canal.category,
                 overwrites=overwrites,
+                topic=ticket.montar_topico(autor=interaction.user.id),
                 reason="Ticket em andamento",
             )
         except (discord.HTTPException, AttributeError) as exc:
@@ -331,6 +340,50 @@ async def fechar(interaction: discord.Interaction):
         await canal.set_permissions(interaction.guild.default_role,
                                    view_channel=False, send_messages=False,
                                    read_message_history=False)
+
+
+@bot.tree.command(
+    description="Gera (ou gera de novo) o relatório deste ticket a partir do histórico.")
+@app_commands.describe(
+    categoria="Só se o ticket não tiver categoria registrada",
+    tipo="Tipo de serviço (junto com a categoria)",
+    colaborador="Quem fez o atendimento (padrão: quem abriu o ticket)")
+@app_commands.choices(categoria=[
+    app_commands.Choice(name=c, value=c) for c in fluxo.categorias()])
+async def gerar_relatorio(interaction: discord.Interaction,
+                          categoria: app_commands.Choice[str] = None,
+                          tipo: str = None,
+                          colaborador: discord.Member = None):
+    if (erro := _checar_comando_de_acesso(interaction)):
+        await interaction.response.send_message(erro, ephemeral=True)
+        return
+    cat = categoria.value if categoria else None
+    if bool(cat) != bool(tipo):
+        await interaction.response.send_message(
+            "Informe a categoria **e** o tipo juntos (ou nenhum dos dois).", ephemeral=True)
+        return
+    if cat and tipo not in fluxo.subtipos(cat):
+        await interaction.response.send_message(
+            f"Tipo inválido para {cat}. Opções: {', '.join(fluxo.subtipos(cat))}.",
+            ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "Gerando o relatório a partir do histórico do canal... ⏳", ephemeral=True)
+    ok = await ticket.finalizar_ticket_livre(
+        bot, interaction.channel, categoria=cat, subtipo=tipo, autor=colaborador)
+    await interaction.followup.send(
+        "✅ Relatório gerado e ticket fechado." if ok
+        else "⚠️ Houve pendências — veja a mensagem no canal.", ephemeral=True)
+
+
+@gerar_relatorio.autocomplete("tipo")
+async def _autocomplete_tipo(interaction: discord.Interaction, atual: str):
+    cat = getattr(interaction.namespace, "categoria", None)
+    opcoes = (fluxo.subtipos(cat) if cat else
+              sorted({s for c in fluxo.categorias() for s in fluxo.subtipos(c)}))
+    return [app_commands.Choice(name=s, value=s)
+            for s in opcoes if atual.lower() in s.lower()][:25]
 
 
 def _eh_thread_ticket(thread: discord.Thread) -> bool:
@@ -560,16 +613,28 @@ async def on_member_remove(member: discord.Member):
 # --------------------------------------------------------------------------
 # Ciclo de vida
 # --------------------------------------------------------------------------
+@bot.listen("on_message")
+async def _detectar_pronto(message: discord.Message):
+    await ticket.tratar_mensagem(bot, message)
+
+
 @bot.event
 async def setup_hook():
     bot.add_view(PainelView())     # reativa o botão após reinício
+    bot.add_view(ticket.FecharChamadoView())
     await bot.tree.sync()
+
+
+_painel_postado = False
 
 
 @bot.event
 async def on_ready():
+    global _painel_postado
     print(f"Bot online como {bot.user} (id: {bot.user.id})")
-    if config.PANEL_CHANNEL_ID:
+    # on_ready dispara de novo a cada reconexão; posta o painel só uma vez.
+    if config.PANEL_CHANNEL_ID and not _painel_postado:
+        _painel_postado = True
         canal = bot.get_channel(config.PANEL_CHANNEL_ID)
         if canal:
             embed = discord.Embed(

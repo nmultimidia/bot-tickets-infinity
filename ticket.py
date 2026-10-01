@@ -1,36 +1,155 @@
 """
-Motor do ticket. Conduz o colaborador pelo fluxo de perguntas do fluxograma,
-coleta textos e fotos, gera o PDF e salva na estrutura de pastas.
+Motor do ticket.
+
+Fluxo livre (padrão): o técnico escolhe categoria/tipo e envia textos e fotos
+à vontade. Ao escrever "pronto", o canal trava para ele e a administração
+recebe o botão para gerar o relatório.
+
+O relatório do fluxo livre é montado a partir do HISTÓRICO do canal, e não da
+memória do bot. Assim nada se perde se o bot reiniciar, se o técnico demorar
+horas entre uma foto e outra, ou se outra pessoa do ticket enviar as fotos.
+Categoria, tipo e autor ficam gravados no tópico do canal.
+
+Fluxo com perguntas (FLUXO_TICKET_LIVRE=false): conduz o colaborador pelo
+fluxograma passo a passo.
 """
 import asyncio
-from pathlib import Path
+import io
+import os
+import re
+import traceback
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 import discord
+from PIL import Image as PILImage
 
 import flow
+import gdrive
 import storage
 import config
 import logs
 from config import STEP_TIMEOUT
 from pdf_generator import gerar_pdf, extrair_localizacao
 
-# Palavras que o colaborador digita para encerrar o envio de várias fotos
-PALAVRAS_FIM = {"pronto", "fim", "ok", "concluir", "finalizar"}
+# Palavras que encerram o envio de várias fotos no fluxo com perguntas
+PALAVRAS_FIM = {"pronto", "pronta", "fim", "ok", "concluir", "concluido",
+                "finalizar", "finalizado"}
+# No fluxo livre "ok" fica de fora: é resposta comum numa conversa e
+# travaria o ticket sem querer.
+PALAVRAS_FIM_LIVRE = PALAVRAS_FIM - {"ok"}
+_NEGACOES = {"nao", "n", "nem", "ainda"}
+
+_EXTENSOES_IMAGEM = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif",
+                     ".tiff", ".heic", ".heif"}
 
 
 def _anexo_imagem(anexo):
     tipo = (anexo.content_type or "").lower()
-    return tipo.startswith("image/") or Path(anexo.filename).suffix.lower() in {
-        ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff",
-    }
+    return tipo.startswith("image/") or Path(anexo.filename).suffix.lower() in _EXTENSOES_IMAGEM
 
 
+def _palavras(texto):
+    texto = unicodedata.normalize("NFKD", texto or "").encode("ascii", "ignore").decode()
+    return re.findall(r"[a-z0-9]+", texto.lower())
+
+
+def eh_pedido_de_fim(texto, palavras=PALAVRAS_FIM_LIVRE, max_palavras=3):
+    """Aceita "pronto", "Pronto.", "pronto!", "tá pronto", "pronto ✅"...
+    mas não frases longas nem negações ("ainda não está pronto")."""
+    msg = _palavras(texto)
+    if not msg or len(msg) > max_palavras or _NEGACOES & set(msg):
+        return False
+    return any(p in palavras for p in msg)
+
+
+# --------------------------------------------------------------------------
+# Tópico do canal: guarda autor, categoria e tipo de forma persistente
+# --------------------------------------------------------------------------
+def ler_topico(canal) -> dict:
+    dados = {}
+    for parte in (getattr(canal, "topic", None) or "").split("|"):
+        chave, sep, valor = parte.partition("=")
+        if sep:
+            dados[chave.strip()] = valor.strip()
+    return dados
+
+
+def montar_topico(**campos) -> str:
+    return " | ".join(f"{k}={v}" for k, v in campos.items() if v)[:1024]
+
+
+async def _gravar_categoria(canal, autor_id, categoria, subtipo):
+    if not isinstance(canal, discord.TextChannel):
+        return
+    try:
+        await canal.edit(topic=montar_topico(autor=autor_id, categoria=categoria, tipo=subtipo))
+    except discord.HTTPException as e:
+        print("Falha ao gravar o tópico do ticket:", e)
+
+
+async def _autor_do_canal(canal, dados=None):
+    """Quem abriu o ticket: pelo tópico ou, em tickets antigos, pela permissão
+    dada na criação (o criador tem manage_channels=False explícito)."""
+    dados = dados if dados is not None else ler_topico(canal)
+    aid = dados.get("autor", "")
+    if aid.isdigit():
+        membro = canal.guild.get_member(int(aid))
+        if membro:
+            return membro
+        try:
+            return await canal.guild.fetch_member(int(aid))
+        except discord.HTTPException:
+            pass
+    for alvo, ow in getattr(canal, "overwrites", {}).items():
+        if (isinstance(alvo, discord.Member) and not alvo.bot
+                and ow.view_channel and ow.manage_channels is False):
+            return alvo
+    return None
+
+
+async def _permitir_envio(canal, membro, permitir: bool):
+    if not isinstance(canal, discord.TextChannel) or not isinstance(membro, discord.Member):
+        return
+    ow = canal.overwrites_for(membro)
+    ow.update(view_channel=True, read_message_history=True, send_messages=permitir)
+    try:
+        await canal.set_permissions(membro, overwrite=ow)
+    except discord.HTTPException as e:
+        print("Falha ao alterar permissão no ticket:", e)
+
+
+async def _renomear(canal, nome):
+    # Renomear tem limite de 2 por 10 min no Discord; roda em segundo plano
+    # para não segurar o fechamento esperando o rate limit.
+    try:
+        await canal.edit(name=nome[:100])
+    except discord.HTTPException as e:
+        print("Falha ao renomear o ticket:", e)
+
+
+async def encerrar_canal(canal, autor):
+    if isinstance(canal, discord.Thread):
+        try:
+            await canal.edit(archived=True, locked=True)
+        except discord.HTTPException:
+            pass
+        return
+    await _permitir_envio(canal, autor, False)
+    if not canal.name.endswith("-fechado"):
+        asyncio.create_task(_renomear(canal, f"{canal.name}-fechado"))
+
+
+# --------------------------------------------------------------------------
+# Componentes
+# --------------------------------------------------------------------------
 class SelectView(discord.ui.View):
     """Menu suspenso genérico que resolve um Future com a opção escolhida."""
 
-    def __init__(self, opcoes, autor_id, placeholder="Selecione..."):
-        super().__init__(timeout=STEP_TIMEOUT)
+    def __init__(self, opcoes, autor_id, placeholder="Selecione...", timeout=STEP_TIMEOUT):
+        super().__init__(timeout=timeout)
         self.autor_id = autor_id
         self.future: asyncio.Future = asyncio.get_event_loop().create_future()
         select = discord.ui.Select(
@@ -51,6 +170,11 @@ class SelectView(discord.ui.View):
             self.future.set_result(self._select.values[0])
         self.stop()
 
+    async def on_timeout(self):
+        # Sem isso quem espera o Future ficaria travado para sempre.
+        if not self.future.done():
+            self.future.set_exception(asyncio.TimeoutError())
+
 
 class YesNoView(discord.ui.View):
     def __init__(self, autor_id):
@@ -68,6 +192,10 @@ class YesNoView(discord.ui.View):
             self.future.set_result(valor)
         self.stop()
 
+    async def on_timeout(self):
+        if not self.future.done():
+            self.future.set_exception(asyncio.TimeoutError())
+
     @discord.ui.button(label="Sim", style=discord.ButtonStyle.success)
     async def sim(self, interaction: discord.Interaction, _):
         await self._responder(interaction, "Sim")
@@ -75,6 +203,17 @@ class YesNoView(discord.ui.View):
     @discord.ui.button(label="Não", style=discord.ButtonStyle.danger)
     async def nao(self, interaction: discord.Interaction, _):
         await self._responder(interaction, "Não")
+
+
+async def escolher_categoria(canal, autor_id, timeout=None):
+    """Pergunta categoria e tipo pelos menus. Devolve (categoria, subtipo)."""
+    escolhas = []
+    for pergunta, opcoes in (("Qual o tipo de assunto?", lambda: flow.categorias()),
+                             ("Qual o tipo de serviço?", lambda: flow.subtipos(escolhas[0]))):
+        view = SelectView(opcoes(), autor_id, placeholder=pergunta, timeout=timeout)
+        await canal.send(pergunta, view=view)
+        escolhas.append(await view.future)
+    return escolhas[0], escolhas[1]
 
 
 def _pode_fechar(member: discord.Member) -> bool:
@@ -88,13 +227,15 @@ def _pode_fechar(member: discord.Member) -> bool:
 
 
 class FecharChamadoView(discord.ui.View):
-    """Botão exclusivo da administração: gera o PDF/relatório e arquiva."""
+    """Botão exclusivo da administração: gera o PDF/relatório e fecha.
 
-    def __init__(self, ticket_flow, categoria, subtipo):
+    Não guarda estado: tudo vem do canal. Registrado com bot.add_view, então
+    continua funcionando depois de reiniciar o bot (inclusive em botões
+    publicados antes desta versão, que usam o mesmo custom_id)."""
+
+    def __init__(self, desativado=False):
         super().__init__(timeout=None)
-        self.ticket_flow = ticket_flow
-        self.categoria = categoria
-        self.subtipo = subtipo
+        self.fechar.disabled = desativado
 
     @discord.ui.button(label="Fechar e gerar relatório", style=discord.ButtonStyle.success,
                        emoji="📋", custom_id="fechar_chamado_livre")
@@ -103,12 +244,308 @@ class FecharChamadoView(discord.ui.View):
             await interaction.response.send_message(
                 "Apenas a administração pode fechar este chamado.", ephemeral=True)
             return
-        button.disabled = True
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send("Gerando relatório... ⏳")
-        await self.ticket_flow._finalizar(self.categoria, self.subtipo)
+        canal = interaction.channel
+        if getattr(canal, "name", "").endswith("-fechado"):
+            await interaction.response.send_message(
+                "Este chamado já foi fechado. Para gerar o relatório de novo, "
+                "use `/gerar_relatorio`.", ephemeral=True)
+            return
+        await interaction.response.edit_message(view=FecharChamadoView(desativado=True))
+        ok = await finalizar_ticket_livre(interaction.client, canal)
+        if not ok:
+            try:
+                await interaction.message.edit(view=FecharChamadoView())
+            except discord.HTTPException:
+                pass
 
 
+# --------------------------------------------------------------------------
+# Fluxo livre: "pronto" e geração do relatório a partir do histórico
+# --------------------------------------------------------------------------
+_marcando_pronto = set()
+_travas = {}
+
+
+def _eh_canal_ticket(canal) -> bool:
+    return (isinstance(canal, (discord.TextChannel, discord.Thread))
+            and canal.name.startswith("ticket-"))
+
+
+async def tratar_mensagem(bot, msg: discord.Message):
+    """Listener global de on_message: detecta o "pronto" em qualquer ticket,
+    de qualquer participante, mesmo depois de o bot reiniciar."""
+    if msg.author.bot or not config.FLUXO_TICKET_LIVRE:
+        return
+    canal = msg.channel
+    if not _eh_canal_ticket(canal) or canal.name.endswith("-fechado"):
+        return
+    if not eh_pedido_de_fim(msg.content):
+        return
+    if canal.id in _marcando_pronto:
+        return
+    _marcando_pronto.add(canal.id)
+    try:
+        await marcar_pronto(canal, msg.author)
+    except asyncio.TimeoutError:
+        await canal.send("⏱️ A categoria não foi escolhida. Escreva **pronto** de novo quando quiser.")
+    except Exception as e:  # noqa
+        traceback.print_exc()
+        await canal.send(
+            f"❌ Não consegui marcar o ticket como concluído: `{e}`\n"
+            "Nada foi perdido: todas as mensagens e fotos continuam neste canal. "
+            "Escreva **pronto** de novo ou chame a administração.")
+    finally:
+        _marcando_pronto.discard(canal.id)
+
+
+async def marcar_pronto(canal, quem):
+    dados = ler_topico(canal)
+    autor = await _autor_do_canal(canal, dados) or quem
+    categoria, subtipo = dados.get("categoria"), dados.get("tipo")
+    if categoria not in flow.categorias() or subtipo not in flow.subtipos(categoria):
+        await canal.send(f"{quem.mention}, antes de finalizar escolha o tipo de assunto e de serviço:")
+        categoria, subtipo = await escolher_categoria(canal, quem.id, timeout=3600)
+        await _gravar_categoria(canal, autor.id, categoria, subtipo)
+
+    await _permitir_envio(canal, autor, False)
+    await canal.send(
+        "🔒 Atendimento marcado como concluído. Todas as mensagens e fotos deste "
+        "canal vão para o relatório. Um administrador vai revisar e fechar o chamado.")
+
+    embed = discord.Embed(
+        title="🔒 Ticket pronto para fechamento",
+        description=(f"Colaborador: {autor.mention}\n"
+                     f"Categoria: **{categoria}** • Tipo: **{subtipo}**\n"
+                     f"Canal: {canal.mention}"),
+        color=0xf1c40f,
+    )
+    embed.timestamp = discord.utils.utcnow()
+    await logs.enviar(canal.guild, "ticket", embed)
+
+    await canal.send(
+        "Administração: clique abaixo para gerar o relatório e fechar.",
+        view=FecharChamadoView())
+
+
+@dataclass
+class Historico:
+    textos: list = field(default_factory=list)
+    imagens: list = field(default_factory=list)       # bytes, para o PDF
+    outros: list = field(default_factory=list)        # nomes de anexos não-imagem
+    transcricao: list = field(default_factory=list)
+    falhas: list = field(default_factory=list)
+    primeiro_autor: object = None
+    total_anexos: int = 0
+
+
+async def _salvar_anexo(att, destino, tentativas=3):
+    for i in range(tentativas):
+        try:
+            await att.save(destino, use_cached=False)
+            return
+        except Exception:  # noqa — rede/CDN instável: tenta de novo
+            if i == tentativas - 1:
+                raise
+            await asyncio.sleep(2 * (i + 1))
+
+
+async def coletar_historico(canal, bot_user, autor_id, pasta_anexos) -> Historico:
+    """Lê o canal inteiro e salva cada anexo original em pasta_anexos."""
+    h = Historico()
+    async for msg in canal.history(limit=None, oldest_first=True):
+        if msg.author.bot:
+            if bot_user and msg.author.id == bot_user.id and msg.content:
+                h.transcricao.append(("Bot", msg.content))
+            continue
+
+        if h.primeiro_autor is None:
+            h.primeiro_autor = msg.author
+        nome = msg.author.display_name
+        quando = msg.created_at.astimezone().strftime("%d/%m %H:%M")
+        conteudo = (msg.content or "").strip()
+        if conteudo and not eh_pedido_de_fim(conteudo):
+            h.textos.append(conteudo if msg.author.id == autor_id else f"{nome}: {conteudo}")
+
+        for att in msg.attachments:
+            h.total_anexos += 1
+            os.makedirs(pasta_anexos, exist_ok=True)
+            destino = os.path.join(pasta_anexos, storage.nome_anexo(h.total_anexos, att.filename))
+            try:
+                await _salvar_anexo(att, destino)
+            except Exception as e:  # noqa
+                h.falhas.append(f"{att.filename} ({nome}, {quando}): {e}")
+                continue
+            if _anexo_imagem(att):
+                with open(destino, "rb") as f:
+                    h.imagens.append(f.read())
+            else:
+                h.outros.append(att.filename)
+
+        resumo = conteudo
+        if msg.attachments:
+            resumo = f"{resumo} [{len(msg.attachments)} anexo(s)]".strip()
+        if resumo:
+            h.transcricao.append((f"{nome} ({quando})", resumo))
+    return h
+
+
+async def finalizar_ticket_livre(bot, canal, *, categoria=None, subtipo=None, autor=None):
+    """Gera o relatório a partir do histórico do canal. Devolve True se tudo
+    (PDF, arquivos e Google Drive) deu certo e o ticket foi fechado."""
+    trava = _travas.setdefault(canal.id, asyncio.Lock())
+    if trava.locked():
+        await canal.send("⏳ O relatório deste ticket já está sendo gerado. Aguarde.")
+        return False
+    async with trava:
+        try:
+            dados = ler_topico(canal)
+            categoria = categoria or dados.get("categoria")
+            subtipo = subtipo or dados.get("tipo")
+            if not categoria or not subtipo:
+                await canal.send(
+                    "❌ Não sei a categoria/tipo deste ticket. A administração pode usar "
+                    "`/gerar_relatorio` informando a categoria e o tipo.")
+                return False
+
+            await canal.send("📥 Lendo o histórico do ticket e baixando os arquivos... ⏳")
+            autor = autor or await _autor_do_canal(canal, dados)
+            quando = canal.created_at.astimezone()
+            nome_autor = autor.display_name if autor else "Colaborador"
+            caminho = storage.montar_caminho(categoria, subtipo, nome_autor, quando)
+            pasta = storage.pasta_anexos(caminho)
+
+            h = await coletar_historico(canal, bot.user, autor.id if autor else None, pasta)
+            if autor is None and h.primeiro_autor is not None:
+                autor = h.primeiro_autor
+
+            respostas = [
+                {"label": "Registro do atendimento", "type": "text",
+                 "valor": "\n".join(h.textos) if h.textos else "—"},
+                {"label": "Fotos enviadas", "type": "photo", "imagens": h.imagens},
+            ]
+            if h.outros:
+                respostas.append({"label": "Outros arquivos (salvos junto com o PDF)",
+                                  "type": "text", "valor": "\n".join(h.outros)})
+
+            localizacao = next(filter(None, map(extrair_localizacao, h.imagens)), None)
+            ok = await registrar_chamado(
+                canal, autor=autor, categoria=categoria, subtipo=subtipo, quando=quando,
+                caminho=caminho, pasta=pasta, respostas=respostas,
+                transcricao=h.transcricao, localizacao=localizacao,
+                n_fotos=len(h.imagens), n_outros=len(h.outros), falhas=h.falhas)
+            if ok:
+                await encerrar_canal(canal, autor)
+            return ok
+        except Exception as e:  # noqa
+            traceback.print_exc()
+            await canal.send(
+                f"❌ Erro ao gerar o relatório: `{e}`\n"
+                "Nada foi perdido: todas as mensagens e fotos continuam neste canal. "
+                "Tente de novo pelo botão ou com `/gerar_relatorio`.")
+            return False
+
+
+def _corta(texto, limite=300):
+    texto = str(texto)
+    return texto if len(texto) <= limite else texto[:limite] + "…"
+
+
+async def registrar_chamado(canal, *, autor, categoria, subtipo, quando, caminho, pasta,
+                            respostas, transcricao, localizacao, n_fotos, n_outros=0,
+                            falhas=()):
+    """Gera o PDF, envia PDF + originais ao Drive e avisa no canal e no log.
+    Devolve True só se não houve nenhuma pendência."""
+    nome_autor = autor.display_name if autor else "Colaborador"
+    meta = {
+        "colaborador": nome_autor,
+        "data_hora": quando,
+        "gerado_em": datetime.now(),
+        "categoria": categoria,
+        "subtipo": subtipo,
+        "localizacao": localizacao,
+    }
+    # PDF e upload são síncronos e pesados: fora do event loop para não
+    # derrubar a conexão do bot com o Discord.
+    await asyncio.to_thread(gerar_pdf, caminho, meta=meta, respostas=respostas,
+                            transcricao=transcricao)
+
+    link_drive, erro_drive = None, None
+    if gdrive.habilitado():
+        try:
+            comps = storage.componentes_pasta(categoria, subtipo, quando)
+            link_drive = await asyncio.to_thread(gdrive.upload_pdf, caminho, comps)
+            if os.path.isdir(pasta):
+                await asyncio.to_thread(gdrive.upload_pasta, pasta, comps)
+        except Exception as e:  # noqa
+            traceback.print_exc()
+            erro_drive = gdrive.explicar_erro(e)
+
+    nome = os.path.basename(caminho)
+    local = os.path.relpath(caminho, config.STORAGE_ROOT)
+    ok = not erro_drive and not falhas
+    linhas = [
+        "✅ **Chamado registrado!**" if ok else "⚠️ **Chamado registrado com pendências**",
+        f"Colaborador: **{nome_autor}**",
+        f"Categoria: **{categoria}** • Tipo: **{subtipo}**",
+        f"Data/Hora: **{quando.strftime('%d/%m/%Y %H:%M')}**",
+        f"Localização: **{localizacao or 'não disponível'}**",
+        f"Fotos: **{n_fotos}**" + (f" • Outros arquivos: **{n_outros}**" if n_outros else ""),
+        f"Arquivo: `{nome}`",
+    ]
+    if link_drive:
+        linhas.append(f"☁️ Google Drive: {link_drive}")
+    if erro_drive:
+        linhas.append(f"❌ **Google Drive falhou:** `{_corta(erro_drive)}`\n"
+                      f"O PDF e os arquivos estão salvos no servidor (`{local}`).")
+    if falhas:
+        linhas.append("❌ **Não consegui baixar:** " + "; ".join(_corta(f, 120) for f in falhas[:5]))
+    if not ok:
+        linhas.append("O ticket continua aberto. Depois de corrigir, gere de novo "
+                      "pelo botão ou com `/gerar_relatorio`.")
+    texto = "\n".join(linhas)[:2000]
+
+    limite = getattr(getattr(canal, "guild", None), "filesize_limit", 8 * 1024 * 1024)
+    try:
+        if os.path.getsize(caminho) <= limite:
+            await canal.send(texto, file=discord.File(caminho))
+        else:
+            await canal.send((texto + "\n_(PDF grande demais para anexar no Discord.)_")[:2000])
+    except discord.HTTPException:
+        await canal.send(texto)
+
+    embed = discord.Embed(
+        title="✅ Ticket finalizado" if ok else "⚠️ Ticket com pendências",
+        description=(f"Colaborador: {autor.mention if autor else nome_autor}\n"
+                     f"Categoria: **{categoria}** • Tipo: **{subtipo}**\n"
+                     f"Data/Hora: **{quando.strftime('%d/%m/%Y %H:%M')}**\n"
+                     f"Canal: {canal.mention}\n"
+                     f"Arquivo: `{nome}`"),
+        color=0x2ecc71 if ok else 0xe67e22,
+    )
+    if link_drive:
+        embed.add_field(name="☁️ Google Drive",
+                        value=f"[Abrir PDF no Google Drive]({link_drive})", inline=False)
+    if erro_drive:
+        embed.add_field(name="❌ Google Drive falhou", value=_corta(erro_drive, 1000), inline=False)
+    if falhas:
+        embed.add_field(name="❌ Arquivos não baixados",
+                        value=_corta("\n".join(falhas), 1000), inline=False)
+    embed.timestamp = discord.utils.utcnow()
+    await logs.enviar(canal.guild, "ticket", embed)
+    return ok
+
+
+def _extensao(dados):
+    try:
+        fmt = PILImage.open(io.BytesIO(dados)).format
+        return "." + ({"JPEG": "jpg"}.get(fmt, fmt or "bin")).lower()
+    except Exception:  # noqa
+        return ".bin"
+
+
+# --------------------------------------------------------------------------
+# Fluxo do ticket
+# --------------------------------------------------------------------------
 class TicketFlow:
     def __init__(self, bot, thread: discord.Thread, autor: discord.Member):
         self.bot = bot
@@ -176,9 +613,10 @@ class TicketFlow:
         imagens = []
         while True:
             msg = await self._aguardar_msg()
-            conteudo = msg.content.strip().lower()
+            palavras = set(_palavras(msg.content))
+            fim = multiplas and eh_pedido_de_fim(msg.content, PALAVRAS_FIM)
 
-            if opcional and conteudo in {"pular", "nao", "não"} and not msg.attachments:
+            if opcional and palavras and palavras <= {"pular", "nao", "n"} and not msg.attachments:
                 self.transcricao.append((self.autor.display_name, "(sem foto)"))
                 break
 
@@ -193,12 +631,12 @@ class TicketFlow:
                     continue
                 self.transcricao.append(
                     (self.autor.display_name, f"[{len(msg.attachments)} anexo(s)]"))
-                if not multiplas:
+                if not multiplas or fim:
                     break
                 await self._bot_diz("Foto recebida. Envie mais ou digite **pronto**.")
                 continue
 
-            if multiplas and conteudo in PALAVRAS_FIM:
+            if fim:
                 if imagens or opcional:
                     break
                 await self._bot_diz("Nenhuma foto recebida ainda. Envie ao menos uma.")
@@ -225,85 +663,22 @@ class TicketFlow:
             self.bot.remove_listener(self._receber_msg, "on_message")
 
     async def _run_livre(self):
-        """Ticket sem perguntas: o técnico envia texto/fotos à vontade e
-        escreve 'pronto' para travar. Só a administração fecha e gera o PDF."""
+        """Ticket sem perguntas: só pede categoria/tipo e grava no tópico.
+        O "pronto" e o relatório são tratados por tratar_mensagem e
+        finalizar_ticket_livre, a partir do histórico do canal."""
         try:
-            categoria = await self._ask_select(
-                "Qual o tipo de assunto?", flow.categorias())
-            subtipo = await self._ask_select(
-                "Qual o tipo de serviço?", flow.subtipos(categoria))
-
             await self._bot_diz(
-                f"Pode enviar fotos, textos e informações à vontade, {self.autor.mention}. "
-                f"Quando finalizar o atendimento, escreva **pronto**.")
-
-            textos = []
-            fotos = []
-            while True:
-                msg = await self._aguardar_msg()
-                conteudo = (msg.content or "").strip()
-
-                if msg.attachments:
-                    for att in msg.attachments:
-                        if _anexo_imagem(att):
-                            fotos.append(await att.read())
-                    self.transcricao.append(
-                        (self.autor.display_name,
-                         conteudo or f"[{len(msg.attachments)} anexo(s)]"))
-                    if conteudo:
-                        textos.append(conteudo)
-                    continue
-
-                if conteudo.lower() == "pronto":
-                    self.transcricao.append((self.autor.display_name, conteudo))
-                    break
-
-                if conteudo:
-                    textos.append(conteudo)
-                    self.transcricao.append((self.autor.display_name, conteudo))
-
-            for b in fotos:
-                if self.localizacao is None:
-                    self.localizacao = extrair_localizacao(b)
-
-            self.respostas = [
-                {"label": "Registro do atendimento", "type": "text",
-                 "valor": "\n".join(textos) if textos else "—"},
-                {"label": "Fotos enviadas", "type": "photo", "imagens": fotos},
-            ]
-
-            # Trava a thread: quem não tem "Gerenciar Tópicos" não consegue
-            # mais escrever. A administração continua conseguindo agir.
-            try:
-                await self.thread.edit(locked=True)
-            except discord.HTTPException:
-                pass
-
-            await self._bot_diz(
-                "🔒 Atendimento marcado como concluído e travado. "
-                "Um administrador vai revisar e fechar o chamado.")
-
-            embed = discord.Embed(
-                title="🔒 Ticket pronto para fechamento",
-                description=(f"Colaborador: {self.autor.mention}\n"
-                             f"Categoria: **{categoria}** • Tipo: **{subtipo}**\n"
-                             f"Thread: {self.thread.mention}"),
-                color=0xf1c40f,
-            )
-            embed.timestamp = discord.utils.utcnow()
-            await logs.enviar(self.thread.guild, "ticket", embed)
-
-            view = FecharChamadoView(self, categoria, subtipo)
-            await self.thread.send(
-                "Administração: clique abaixo para gerar o relatório e arquivar.",
-                view=view)
-
-        except asyncio.TimeoutError:
-            await self.thread.send(
-                "⏱️ Tempo esgotado sem resposta. O ticket foi cancelado. "
-                "Abra um novo quando quiser.")
+                f"Olá, {self.autor.mention}! Pode enviar fotos, textos e informações "
+                f"à vontade, sem limite de tempo. Quando finalizar o atendimento, "
+                f"escreva **pronto**.")
+            categoria, subtipo = await escolher_categoria(self.thread, self.autor.id)
+            await _gravar_categoria(self.thread, self.autor.id, categoria, subtipo)
+            await self._bot_diz(f"📂 **{categoria}** • **{subtipo}** registrado.")
         except Exception as e:  # noqa
-            await self.thread.send(f"❌ Ocorreu um erro ao processar o ticket: `{e}`")
+            traceback.print_exc()
+            await self.thread.send(
+                f"❌ Erro ao registrar a categoria: `{e}`. Pode continuar enviando "
+                "fotos e textos; ao escrever **pronto** eu pergunto de novo.")
 
     async def _run_com_perguntas(self):
         try:
@@ -346,66 +721,24 @@ class TicketFlow:
                 "⏱️ Tempo esgotado sem resposta. O ticket foi cancelado. "
                 "Abra um novo quando quiser.")
         except Exception as e:  # noqa
+            traceback.print_exc()
             await self.thread.send(f"❌ Ocorreu um erro ao processar o ticket: `{e}`")
 
     async def _finalizar(self, categoria, subtipo):
         await self._bot_diz("Registrando o chamado e gerando o relatório... ⏳")
 
         quando = datetime.now()
-        meta = {
-            "colaborador": self.autor.display_name,
-            "data_hora": quando,
-            "categoria": categoria,
-            "subtipo": subtipo,
-            "localizacao": self.localizacao,
-        }
-
         caminho = storage.montar_caminho(categoria, subtipo, self.autor.display_name, quando)
-        gerar_pdf(caminho, meta=meta, respostas=self.respostas, transcricao=self.transcricao)
+        pasta = storage.pasta_anexos(caminho)
+        fotos = [b for r in self.respostas for b in r.get("imagens", [])]
+        arquivos = [(f"foto{_extensao(b)}", b) for b in fotos]
+        await asyncio.to_thread(storage.salvar_anexos, pasta, arquivos)
 
-        # Envia também para o Google Drive (se habilitado). Uma falha aqui NÃO
-        # cancela o chamado — o PDF já está salvo localmente.
-        link_drive = None
-        try:
-            import gdrive
-            comps = storage.componentes_pasta(categoria, subtipo, quando)
-            link_drive = gdrive.upload_pdf(caminho, comps)
-        except Exception as e:  # noqa
-            print("Falha ao enviar para o Google Drive:", e)
-
-        import os
-        nome = os.path.basename(caminho)
-        linha_drive = f"\n☁️ Google Drive: {link_drive}" if link_drive else ""
-        await self.thread.send(
-            f"✅ **Chamado finalizado!**\n"
-            f"Colaborador: **{self.autor.display_name}**\n"
-            f"Categoria: **{categoria}** • Tipo: **{subtipo}**\n"
-            f"Data/Hora: **{quando.strftime('%d/%m/%Y %H:%M')}**\n"
-            f"Localização: **{self.localizacao or 'não disponível'}**\n"
-            f"Arquivo: `{nome}`{linha_drive}",
-            file=discord.File(caminho),
-        )
-        # Aviso no canal de log de tickets (definido via /definir_log)
-        embed = discord.Embed(
-            title="✅ Ticket finalizado",
-            description=(f"Colaborador: {self.autor.mention}\n"
-                         f"Categoria: **{categoria}** • Tipo: **{subtipo}**\n"
-                         f"Data/Hora: **{quando.strftime('%d/%m/%Y %H:%M')}**\n"
-                         f"Arquivo: `{nome}`"),
-            color=0x2ecc71,
-        )
-        if link_drive:
-            embed.add_field(
-                name="☁️ Google Drive",
-                value=f"[Abrir PDF no Google Drive]({link_drive})",
-                inline=False,
-            )
-        embed.timestamp = discord.utils.utcnow()
-        await logs.enviar(self.thread.guild, "ticket", embed)
-
-        # Fecha a thread após alguns segundos
-        await asyncio.sleep(2)
-        try:
-            await self.thread.edit(archived=True, locked=True)
-        except discord.HTTPException:
-            pass
+        ok = await registrar_chamado(
+            self.thread, autor=self.autor, categoria=categoria, subtipo=subtipo,
+            quando=quando, caminho=caminho, pasta=pasta, respostas=self.respostas,
+            transcricao=self.transcricao, localizacao=self.localizacao,
+            n_fotos=len(fotos))
+        if ok:
+            await asyncio.sleep(2)
+            await encerrar_canal(self.thread, self.autor)

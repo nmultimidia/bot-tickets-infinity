@@ -15,11 +15,15 @@ pastas padronizada.
 - ✅ Geração de **PDF** com metadados + respostas + fotos + transcrição da conversa
 - ✅ Salvamento na hierarquia: `Categoria / Mês Ano / Tipo de Serviço / Dia / arquivo.pdf`
 - ✅ Nome do PDF: `Dia_HoraMin_TipoServico_NomeColaborador.pdf`
-- ✅ Upload do PDF também para o **Google Drive** (opcional, via conta de serviço)
+- ✅ Upload do PDF **e dos arquivos originais** (fotos em resolução cheia, vídeos,
+  documentos) também para o **Google Drive** (opcional)
+- ✅ Ticket livre à prova de perdas: o relatório é montado a partir do **histórico
+  do canal**, então reinício do bot, demora do técnico ou fotos enviadas por outra
+  pessoa do ticket não fazem nada se perder
 - ✅ **Logs administrativos** em canais de Staff: aviso de ticket criado/finalizado,
   mensagens editadas/apagadas e entrada/saída de membros
 - ✅ Comandos admin: `/painel`, `/listar`, `/fechar`, `/adicionar`, `/remover`,
-  `/definir_log`, `/ver_logs`
+  `/gerar_relatorio`, `/definir_log`, `/ver_logs`
 
 ## Instalação
 
@@ -52,7 +56,23 @@ python bot.py
 - O técnico clica em **Abrir Ticket** → o bot cria uma thread privada e faz as perguntas.
 - Dentro do ticket, a equipe usa `/adicionar @membro` (ou escolhe um cargo)
   para convidar alguém e `/remover` para retirar seu acesso.
-- Ao final, o PDF é enviado na thread **e** salvo na pasta `STORAGE_ROOT`.
+- Ao final, o PDF é enviado no canal **e** salvo na pasta `STORAGE_ROOT`.
+
+### Ticket livre (`FLUXO_TICKET_LIVRE=true`, padrão)
+
+1. O técnico escolhe o tipo de assunto/serviço e envia fotos e textos à vontade,
+   sem limite de tempo. Qualquer participante do ticket pode enviar fotos.
+2. Ao escrever **pronto** (também vale `Pronto.`, `tá pronto`, `finalizado`, ou
+   `pronto` junto da última foto), o canal trava para o técnico e aparece o botão
+   **Fechar e gerar relatório** para a administração.
+3. Ao clicar, o bot lê **todo o histórico do canal**, baixa cada anexo, gera o PDF
+   e envia PDF + originais ao Drive. Se algo falhar (ex.: Drive), o erro aparece
+   no canal e no log, o ticket **continua aberto** e o botão pode ser clicado de novo.
+
+**Recuperar um ticket** (bot reiniciou, "pronto" não respondeu, PDF saiu sem fotos):
+dentro do canal do ticket, rode `/gerar_relatorio`. Em tickets antigos, que não têm
+a categoria registrada, informe `categoria` e `tipo`. Funciona também em canais já
+fechados (`-fechado`) — gera um relatório novo sem apagar o anterior.
 - `/limpar [dias]` apaga as threads de ticket já arquivadas (pede confirmação); use `dias` para só apagar as mais antigas.
 
 ## Logs administrativos (canais de Staff)
@@ -90,18 +110,25 @@ Definido por `STORAGE_ROOT` no `.env`:
 
 ### Upload direto para o Google Drive (opcional)
 
-Além do salvamento local, cada PDF pode ser enviado direto para o Drive via
-conta de serviço, recriando a mesma hierarquia de pastas. No `.env`:
+Além do salvamento local, cada PDF (e a pasta `..._arquivos` com os originais)
+pode ser enviado direto para o Drive, recriando a mesma hierarquia de pastas. No `.env`:
 
 ```ini
 GDRIVE_ENABLED=true
-GDRIVE_CREDENTIALS=service_account.json   # chave JSON da conta de serviço
+GDRIVE_AUTH=oauth                         # ou service_account
 GDRIVE_ROOT_FOLDER_ID=xxxxxxxx            # trecho após /folders/ na URL da pasta
 ```
 
-A pasta do Drive precisa estar **compartilhada com o e-mail da conta de serviço**
-(permissão de Editor). Uma falha no upload não cancela o chamado — o PDF já fica
-salvo localmente e o erro aparece no log do bot.
+- **`oauth` (recomendado para Drive pessoal/Gmail):** rode `authorize_drive.py` uma
+  vez com a conta dona da pasta. Deixe o app OAuth no Google Cloud **"Em produção"**:
+  em modo "Teste" o token expira a cada 7 dias e os uploads param.
+- **`service_account`:** só funciona em **Drive compartilhado** — contas de serviço
+  não têm espaço para gravar arquivos em Drive pessoal (as pastas são criadas,
+  mas o PDF falha com `storageQuotaExceeded`).
+
+Uma falha no upload não perde nada: o PDF e os originais ficam salvos localmente,
+o erro (com a provável causa) aparece **no canal do ticket e no log de tickets**, e
+o ticket fica aberto para gerar de novo.
 
 ## Deploy 24/7
 

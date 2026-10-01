@@ -12,13 +12,18 @@ Setup resumido (detalhes na resposta):
   3. Compartilhar a pasta do Drive com o e-mail da conta de serviço (como Editor).
   4. Preencher no .env: GDRIVE_ENABLED, GDRIVE_CREDENTIALS, GDRIVE_ROOT_FOLDER_ID.
 """
+import mimetypes
 import os
+import threading
 
 from config import GDRIVE_ENABLED, GDRIVE_CREDENTIALS, GDRIVE_ROOT_FOLDER_ID
 from config import GDRIVE_AUTH, GDRIVE_OAUTH_TOKEN
 
 _service = None
 _folder_cache = {}          # evita recriar/reprocurar pastas a cada chamado
+# O cliente HTTP do Google não é thread-safe e os uploads rodam fora do
+# event loop (asyncio.to_thread): um chamado por vez.
+_lock = threading.Lock()
 
 _SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -92,6 +97,46 @@ def _pasta(service, nome, parent_id):
     return fid
 
 
+def habilitado():
+    return GDRIVE_ENABLED
+
+
+def _executar(acao):
+    """Roda acao(service). Em caso de erro, descarta cache de pastas e o
+    serviço (token renovado, pasta apagada no Drive...) e tenta mais uma vez."""
+    global _service
+    with _lock:
+        try:
+            return acao(_get_service())
+        except Exception:  # noqa
+            _service = None
+            _folder_cache.clear()
+            return acao(_get_service())
+
+
+def _criar_pastas(service, subpastas):
+    parent = GDRIVE_ROOT_FOLDER_ID
+    for nome in subpastas:
+        parent = _pasta(service, nome, parent)
+    return parent
+
+
+def _enviar(service, caminho_local, parent, mimetype):
+    from googleapiclient.http import MediaFileUpload
+
+    media = MediaFileUpload(caminho_local, mimetype=mimetype, resumable=True)
+    meta = {"name": os.path.basename(caminho_local), "parents": [parent]}
+    return service.files().create(
+        body=meta, media_body=media, fields="id, webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+
+
+def _checar_config():
+    if not GDRIVE_ROOT_FOLDER_ID:
+        raise RuntimeError("GDRIVE_ROOT_FOLDER_ID não configurado no .env")
+
+
 def upload_pdf(caminho_local, subpastas):
     """
     caminho_local: caminho do PDF no disco.
@@ -101,22 +146,48 @@ def upload_pdf(caminho_local, subpastas):
     """
     if not GDRIVE_ENABLED:
         return None
-    if not GDRIVE_ROOT_FOLDER_ID:
-        raise RuntimeError("GDRIVE_ROOT_FOLDER_ID não configurado no .env")
+    _checar_config()
 
-    from googleapiclient.http import MediaFileUpload
+    def acao(service):
+        parent = _criar_pastas(service, subpastas)
+        return _enviar(service, caminho_local, parent, "application/pdf")
 
-    service = _get_service()
-
-    parent = GDRIVE_ROOT_FOLDER_ID
-    for nome in subpastas:
-        parent = _pasta(service, nome, parent)
-
-    media = MediaFileUpload(caminho_local, mimetype="application/pdf", resumable=True)
-    meta = {"name": os.path.basename(caminho_local), "parents": [parent]}
-    arquivo = service.files().create(
-        body=meta, media_body=media, fields="id, webViewLink",
-        supportsAllDrives=True,
-    ).execute()
+    arquivo = _executar(acao)
     return (arquivo.get("webViewLink")
             or f"https://drive.google.com/file/d/{arquivo['id']}/view")
+
+
+def upload_pasta(pasta_local, subpastas):
+    """Envia todos os arquivos de pasta_local para uma subpasta de mesmo nome
+    dentro de subpastas (ao lado do PDF). Para no primeiro erro."""
+    if not GDRIVE_ENABLED or not os.path.isdir(pasta_local):
+        return None
+    _checar_config()
+    destino = list(subpastas) + [os.path.basename(pasta_local)]
+    for nome in sorted(os.listdir(pasta_local)):
+        caminho = os.path.join(pasta_local, nome)
+        tipo = mimetypes.guess_type(nome)[0] or "application/octet-stream"
+        _executar(lambda service: _enviar(
+            service, caminho, _criar_pastas(service, destino), tipo))
+    return destino
+
+
+def explicar_erro(erro) -> str:
+    """Traduz os erros mais comuns do Google em instruções de correção."""
+    texto = f"{type(erro).__name__}: {erro}"
+    baixo = texto.lower()
+    if "storagequotaexceeded" in baixo or "do not have storage quota" in baixo:
+        return (texto + " → Contas de serviço não têm espaço em Drive pessoal. "
+                "Use GDRIVE_AUTH=oauth e gere o token.json com authorize_drive.py.")
+    if "invalid_grant" in baixo or "token.json" in baixo or "refresherror" in baixo:
+        return (texto + " → Autorização do Google expirada/revogada. Rode "
+                "authorize_drive.py de novo. Se o app OAuth estiver em modo "
+                "'Teste' no Google Cloud, o token expira a cada 7 dias: mude "
+                "para 'Em produção'.")
+    if "notfound" in baixo or "file not found" in baixo or " 404" in baixo:
+        return (texto + " → Pasta raiz do Drive não encontrada ou sem acesso. "
+                "Confira GDRIVE_ROOT_FOLDER_ID e se a pasta está compartilhada "
+                "com a conta usada pelo bot (Editor).")
+    if "insufficientpermissions" in baixo or " 403" in baixo:
+        return texto + " → A conta usada pelo bot não tem permissão de Editor na pasta."
+    return texto
