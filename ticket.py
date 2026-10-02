@@ -112,7 +112,18 @@ async def _autor_do_canal(canal, dados=None):
             return await canal.guild.fetch_member(int(aid))
         except discord.HTTPException:
             pass
-    for alvo, ow in getattr(canal, "overwrites", {}).items():
+    return _autor_pela_permissao(canal)
+
+
+def _autor_pela_permissao(canal):
+    """Na criação, o bot dá a quem abriu o ticket manage_channels=False
+    explícito. Essa marca sobrevive a renomeações, inclusive em tickets
+    anteriores ao tópico "autor=<id>"."""
+    try:
+        overwrites = canal.overwrites
+    except AttributeError:
+        return None
+    for alvo, ow in overwrites.items():
         if (isinstance(alvo, discord.Member) and not alvo.bot
                 and ow.view_channel and ow.manage_channels is False):
             return alvo
@@ -274,13 +285,15 @@ _travas = {}
 
 def _eh_canal_ticket(canal) -> bool:
     """Ticket pelo prefixo do nome ou, em canal de texto, pelo tópico
-    "autor=<id>" gravado na criação — assim o ticket continua reconhecido
-    depois que a equipe renomeia o canal (ex: nome da obra)."""
+    "autor=<id>" ou pela permissão do autor — assim o ticket continua
+    reconhecido depois que a equipe renomeia o canal (ex: nome da obra)."""
     if not isinstance(canal, (discord.TextChannel, discord.Thread)):
         return False
     if canal.name.startswith("ticket-"):
         return True
-    return isinstance(canal, discord.TextChannel) and "autor" in ler_topico(canal)
+    if not isinstance(canal, discord.TextChannel):
+        return False
+    return "autor" in ler_topico(canal) or _autor_pela_permissao(canal) is not None
 
 
 async def tratar_mensagem(bot, msg: discord.Message):

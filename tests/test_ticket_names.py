@@ -92,3 +92,26 @@ def test_finalizar_ticket_funciona_em_canal_renomeado():
 
     assert _eh_canal_ticket(_canal_texto("obra-hospital-central", "autor=123 | categoria=OS"))
     assert not _eh_canal_ticket(_canal_texto("obra-hospital-central"))
+
+
+def test_ticket_antigo_renomeado_sem_topico_e_reconhecido_pela_permissao():
+    import discord
+    from ticket import _eh_canal_ticket
+
+    autor = object.__new__(discord.Member)
+    autor._user = type("U", (), {"bot": False})()
+
+    class CanalAntigo(discord.TextChannel):
+        overwrites = {autor: discord.PermissionOverwrite(view_channel=True,
+                                                         manage_channels=False)}
+
+    canal = object.__new__(CanalAntigo)
+    canal.name, canal.topic = "obra-hospital-central", None
+    assert _eh_canal_ticket(canal)
+
+    class CanalComum(discord.TextChannel):
+        overwrites = {autor: discord.PermissionOverwrite(view_channel=True)}
+
+    comum = object.__new__(CanalComum)
+    comum.name, comum.topic = "geral", None
+    assert not _eh_canal_ticket(comum)
