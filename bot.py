@@ -42,7 +42,11 @@ def _thread_kwargs():
 
 
 def _eh_ticket_canal(canal) -> bool:
-    return isinstance(canal, discord.TextChannel) and canal.name.startswith("ticket-")
+    # O tópico "autor=<id>" é gravado pelo bot na criação e sobrevive a
+    # renomeações manuais do canal; o prefixo cobre tickets antigos.
+    if not isinstance(canal, discord.TextChannel):
+        return False
+    return canal.name.startswith("ticket-") or "autor" in ticket.ler_topico(canal)
 
 
 async def _convidar_staff(canal, guild: discord.Guild):

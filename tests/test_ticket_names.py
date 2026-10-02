@@ -33,3 +33,19 @@ def test_nome_ticket_limita_tamanho_e_preserva_data_hora():
 
     assert len(nome) == 90
     assert nome.endswith("180826_1321")
+
+
+def _canal_texto(nome, topico=None):
+    import discord
+    canal = object.__new__(discord.TextChannel)
+    canal.name = nome
+    canal.topic = topico
+    return canal
+
+
+def test_ticket_renomeado_continua_reconhecido_pelo_topico():
+    from bot import _eh_ticket_canal
+
+    assert _eh_ticket_canal(_canal_texto("ticket-guilherme180826_1321"))
+    assert _eh_ticket_canal(_canal_texto("suporte-cliente", "autor=123 | categoria=OS"))
+    assert not _eh_ticket_canal(_canal_texto("geral", "Canal de conversa"))
