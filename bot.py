@@ -228,6 +228,37 @@ def _membros_do_alvo(membro: discord.Member = None,
     return membros
 
 
+def _resolver_membro(guild: discord.Guild, valor: str = None):
+    """Converte o valor do autocomplete (ID) ou um nome digitado em membro."""
+    if not valor or guild is None:
+        return None
+    valor = valor.strip()
+    digitos = re.sub(r"\D", "", valor)
+    if digitos and (membro := guild.get_member(int(digitos))):
+        return membro
+    alvo = valor.lstrip("@").lower()
+    for membro in guild.members:
+        if alvo in {membro.name.lower(), membro.display_name.lower()}:
+            return membro
+    return None
+
+
+def _sugestoes_de_membros(guild: discord.Guild, atual: str, limite: int = 25):
+    """Busca no servidor inteiro, não só em quem já vê o ticket."""
+    atual = (atual or "").lower()
+    sugestoes = []
+    for membro in sorted(guild.members, key=lambda m: m.display_name.lower()):
+        if membro.bot:
+            continue
+        if atual in membro.display_name.lower() or atual in membro.name.lower():
+            rotulo = (membro.display_name if membro.display_name == membro.name
+                      else f"{membro.display_name} (@{membro.name})")
+            sugestoes.append(app_commands.Choice(name=rotulo[:100], value=str(membro.id)))
+            if len(sugestoes) >= limite:
+                break
+    return sugestoes
+
+
 # --------------------------------------------------------------------------
 # Comandos
 # --------------------------------------------------------------------------
@@ -250,10 +281,16 @@ async def painel(interaction: discord.Interaction):
     membro="Quem você quer trazer para o ticket",
     cargo="Ou um cargo inteiro, se não souber quem chamar")
 async def adicionar(interaction: discord.Interaction,
-                    membro: discord.Member = None,
+                    membro: str = None,
                     cargo: discord.Role = None):
     if (erro := _checar_comando_de_acesso(interaction)):
         await interaction.response.send_message(erro, ephemeral=True)
+        return
+    texto_membro, membro = membro, _resolver_membro(interaction.guild, membro)
+    if texto_membro and not membro:
+        await interaction.response.send_message(
+            f"Não encontrei o membro `{texto_membro}`. Escolha um nome da lista.",
+            ephemeral=True)
         return
     if not membro and not cargo:
         await interaction.response.send_message(
@@ -282,6 +319,13 @@ async def adicionar(interaction: discord.Interaction,
     if erros:
         texto += f" Não consegui adicionar {erros} usuário(s)."
     await interaction.followup.send(texto, ephemeral=True)
+
+
+@adicionar.autocomplete("membro")
+async def _autocomplete_membro(interaction: discord.Interaction, atual: str):
+    # O seletor nativo do Discord só lista quem já enxerga o canal; num ticket
+    # privado isso é praticamente só o bot.
+    return _sugestoes_de_membros(interaction.guild, atual)
 
 
 @bot.tree.command(description="Remove uma pessoa (ou um cargo) deste ticket.")

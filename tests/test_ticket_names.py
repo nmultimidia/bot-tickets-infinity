@@ -49,3 +49,39 @@ def test_ticket_renomeado_continua_reconhecido_pelo_topico():
     assert _eh_ticket_canal(_canal_texto("ticket-guilherme180826_1321"))
     assert _eh_ticket_canal(_canal_texto("suporte-cliente", "autor=123 | categoria=OS"))
     assert not _eh_ticket_canal(_canal_texto("geral", "Canal de conversa"))
+
+
+class _Membro:
+    def __init__(self, id, name, display_name, bot=False):
+        self.id, self.name, self.display_name, self.bot = id, name, display_name, bot
+
+
+class _Guild:
+    def __init__(self, membros):
+        self.members = membros
+
+    def get_member(self, id):
+        return next((m for m in self.members if m.id == id), None)
+
+
+def test_autocomplete_busca_no_servidor_todo_e_ignora_bots():
+    from bot import _sugestoes_de_membros
+
+    guild = _Guild([_Membro(1, "ana", "Ana Paula"), _Membro(2, "joao", "joao"),
+                    _Membro(3, "suporte", "Suporte Fibra", bot=True)])
+    nomes = [c.name for c in _sugestoes_de_membros(guild, "")]
+
+    assert nomes == ["Ana Paula (@ana)", "joao"]
+    assert [c.value for c in _sugestoes_de_membros(guild, "ana")] == ["1"]
+
+
+def test_resolver_membro_aceita_id_mencao_ou_nome():
+    from bot import _resolver_membro
+
+    ana = _Membro(1, "ana", "Ana Paula")
+    guild = _Guild([ana])
+
+    assert _resolver_membro(guild, "1") is ana
+    assert _resolver_membro(guild, "<@1>") is ana
+    assert _resolver_membro(guild, "@Ana Paula") is ana
+    assert _resolver_membro(guild, "ninguem") is None
