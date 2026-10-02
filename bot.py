@@ -201,10 +201,17 @@ def eh_admin(interaction: discord.Interaction) -> bool:
     return bool(ids & set(config.ADMIN_ROLE_IDS))
 
 
-def _checar_comando_de_acesso(interaction: discord.Interaction):
-    """Valida os comandos que gerenciam participantes de um ticket."""
+def _checar_comando_de_acesso(interaction: discord.Interaction, exigir_ticket=True):
+    """Valida os comandos que gerenciam participantes de um ticket.
+
+    /adicionar e /remover não exigem ticket reconhecido: tickets antigos
+    renomeados (inclusive threads) podem não ter mais nenhuma marca, e um
+    admin já poderia dar esse acesso manualmente em qualquer canal."""
     canal = interaction.channel
-    if not (isinstance(canal, discord.Thread) and _eh_thread_ticket(canal)) and not _eh_ticket_canal(canal):
+    if not exigir_ticket:
+        if not isinstance(canal, (discord.TextChannel, discord.Thread)):
+            return "Use este comando dentro de um canal de texto ou thread."
+    elif not (isinstance(canal, discord.Thread) and _eh_thread_ticket(canal)) and not _eh_ticket_canal(canal):
         return "Este comando só funciona dentro de um ticket."
     if not eh_admin(interaction):
         return "Sem permissão."
@@ -279,7 +286,7 @@ async def painel(interaction: discord.Interaction):
 async def adicionar(interaction: discord.Interaction,
                     membro: str = None,
                     cargo: discord.Role = None):
-    if (erro := _checar_comando_de_acesso(interaction)):
+    if (erro := _checar_comando_de_acesso(interaction, exigir_ticket=False)):
         await interaction.response.send_message(erro, ephemeral=True)
         return
     texto_membro, membro = membro, _resolver_membro(interaction.guild, membro)
@@ -330,7 +337,7 @@ async def _autocomplete_membro(interaction: discord.Interaction, atual: str):
 async def remover(interaction: discord.Interaction,
                   membro: discord.Member = None,
                   cargo: discord.Role = None):
-    if (erro := _checar_comando_de_acesso(interaction)):
+    if (erro := _checar_comando_de_acesso(interaction, exigir_ticket=False)):
         await interaction.response.send_message(erro, ephemeral=True)
         return
     if not membro and not cargo:
