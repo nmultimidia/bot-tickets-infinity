@@ -85,3 +85,10 @@ def test_resolver_membro_aceita_id_mencao_ou_nome():
     assert _resolver_membro(guild, "<@1>") is ana
     assert _resolver_membro(guild, "@Ana Paula") is ana
     assert _resolver_membro(guild, "ninguem") is None
+
+
+def test_finalizar_ticket_funciona_em_canal_renomeado():
+    from ticket import _eh_canal_ticket
+
+    assert _eh_canal_ticket(_canal_texto("obra-hospital-central", "autor=123 | categoria=OS"))
+    assert not _eh_canal_ticket(_canal_texto("obra-hospital-central"))

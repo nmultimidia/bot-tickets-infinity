@@ -273,8 +273,14 @@ _travas = {}
 
 
 def _eh_canal_ticket(canal) -> bool:
-    return (isinstance(canal, (discord.TextChannel, discord.Thread))
-            and canal.name.startswith("ticket-"))
+    """Ticket pelo prefixo do nome ou, em canal de texto, pelo tópico
+    "autor=<id>" gravado na criação — assim o ticket continua reconhecido
+    depois que a equipe renomeia o canal (ex: nome da obra)."""
+    if not isinstance(canal, (discord.TextChannel, discord.Thread)):
+        return False
+    if canal.name.startswith("ticket-"):
+        return True
+    return isinstance(canal, discord.TextChannel) and "autor" in ler_topico(canal)
 
 
 async def tratar_mensagem(bot, msg: discord.Message):
